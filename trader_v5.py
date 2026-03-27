@@ -5,8 +5,7 @@ Trend‑following core with optional ML overlay, ATR‑based risk,
 dynamic trailing stops, enhanced pair‑trading, and expanded universe.
 Universe (18 assets):
     SPY, QQQ, GLD, XLE, AAPL, TSLA, NVDA, JNJ,
-    META, MU, CRWD, GOOGL, HOOD, PLTR, AMD, RKLB,
-    (plus original 8)
+    META, MU, CRWD, GOOGL, HOOD, PLTR, AMD, RKLB
 Features:
     - SMA 20/50 Golden/Death Cross (trend filter SMA20>SMA50)
     - ADX > 25 filter for trend strength
@@ -59,8 +58,8 @@ CONFIG = {
     "use_ml": False,                 # set True when model is trained
     "ml_prob_threshold": 0.6,
     # --- Misc -----------------------------------------------------------
-    "currency": "USD",
-    "initial_capital": 8000.0,
+    "currency": "EUR",
+    "initial_capital": 10000.0,
     "data_dir": Path(__file__).parent / "trading_data",
     "portfolio_file": Path(__file__).parent / "trading_data" / "portfolio.json",
 }
@@ -274,6 +273,35 @@ class Trader:
     def __init__(self, config: Optional[dict] = None):
         self.cfg = config or CONFIG
         self.portfolio = Portfolio(self.cfg)
+        # If starting fresh, seed NVDA position on 2026-03-23
+        if not self.portfolio.data["positions"] and self.portfolio.data["cash"] == self.cfg["initial_capital"]:
+            try:
+                nvda_df = yf.Ticker("NVDA").history(start="2026-03-23", end="2026-03-24")
+                if not nvda_df.empty:
+                    price = float(nvda_df["Close"].iloc[0])
+                    shares = 6
+                    cost = price * shares
+                    if cost <= self.portfolio.data["cash"]:
+                        self.portfolio.data["cash"] -= cost
+                        atr_val = 0.0  # we could compute ATR but skip for seed
+                        pos = {
+                            "symbol": "NVDA",
+                            "shares": shares,
+                            "entry": price,
+                            "atr_at_entry": atr_val,
+                            "highest": price,
+                            "stop": price - self.cfg["initial_sl_atr_mult"] * atr_val,
+                            "trailing": price - self.cfg["trailing_atr_mult"] * atr_val,
+                            "partial_sold": False,
+                            "reason": "Seed position",
+                            "price": price,
+                        }
+                        self.portfolio.data["positions"]["NVDA"] = pos
+                        self.portfolio._log_trade("NVDA", "BUY", shares, price, 0.0, "Seed position")
+                        self.portfolio.save()
+            except Exception as e:
+                # If seed fails, just continue with empty portfolio
+                pass
         self.strategy = Strategy(self.cfg)
         self.reports_dir = self.cfg["data_dir"] / "reports"
         self.reports_dir.mkdir(exist_ok=True)
@@ -385,7 +413,7 @@ class Trader:
         equity = self.portfolio.equity(price_dict)
         init = self.cfg["initial_capital"]
         ret = (equity / init - 1) * 100
-        print(f"  Equity: {equity:,.2f} USD (Return {ret:+.2f}%)")
+        print(f"  Equity: {equity:,.2f} {self.cfg['currency']} (Return {ret:+.2f}%)")
         self._generate_report(today, price_dict, equity)
         return {
             "date": today,
@@ -402,8 +430,8 @@ class Trader:
         lines.append(f"BOTTI TRADER v5.0 – DAILY REPORT – {date_str}")
         lines.append("="*60)
         lines.append("")
-        lines.append(f"Starting Capital: ${self.cfg['initial_capital']:,.2f}")
-        lines.append(f"Current Equity:   ${equity:,.2f}")
+        lines.append(f"Starting Capital: {self.cfg['initial_capital']:,.2f} {self.cfg['currency']}")
+        lines.append(f"Current Equity:   {equity:,.2f} {self.cfg['currency']}")
         lines.append(f"Return:           {(equity/self.cfg['initial_capital']-1)*100:+.2f}%")
         lines.append("")
         lines.append("Open Positions:")
