@@ -1,0 +1,38 @@
+[                       0%                       ][************          25%                       ]  2 of 8 completed[******************    38%                       ]  3 of 8 completed[**********************50%                       ]  4 of 8 completed[**********************62%*****                  ]  5 of 8 completed[**********************75%***********            ]  6 of 8 completed[**********************88%*****************      ]  7 of 8 completed[*********************100%***********************]  8 of 8 completed
+Backtest 2024-01-01 to 2026-03-27
+Final strategy value: 11065.98
+Buy&Hold value: 14536.34
+Return strategy: 38.32%
+Return B&H: 81.70%
+
+Number of trades: 69
+2025-05-13 TSLA SELL_PARTIAL 5 @ 334.07 PnL 293.60 (Partial Profit)
+2025-05-13 QQQ BUY 5 @ 513.11 PnL 0.00 (Golden Cross)
+2025-05-14 SPY BUY 2 @ 580.93 PnL 0.00 (Golden Cross)
+2025-05-14 NVDA BUY 8 @ 135.31 PnL 0.00 (Golden Cross)
+2025-06-05 TSLA SELL 6 @ 284.70 PnL 56.10 (Trailing Stop)
+2025-06-05 AAPL BUY 7 @ 200.02 PnL 0.00 (Golden Cross)
+2025-06-06 XLE BUY 22 @ 40.41 PnL 0.00 (Golden Cross)
+2025-06-12 JNJ BUY 3 @ 153.72 PnL 0.00 (Golden Cross)
+2025-07-09 NVDA SELL_PARTIAL 4 @ 162.85 PnL 110.18 (Partial Profit)
+2025-08-11 TSLA BUY 1 @ 339.03 PnL 0.00 (Golden Cross)
+2025-08-21 TSLA SELL 1 @ 320.11 PnL -18.92 (Stop-Loss)
+2025-09-19 AAPL SELL_PARTIAL 3 @ 245.03 PnL 135.03 (Partial Profit)
+2025-10-03 JNJ SELL_PARTIAL 1 @ 186.46 PnL 32.74 (Partial Profit)
+2025-10-27 QQQ SELL_PARTIAL 2 @ 626.49 PnL 226.77 (Partial Profit)
+2025-11-04 GLD SELL 4 @ 362.32 PnL 553.96 (Trailing Stop)
+2025-11-18 NVDA SELL 4 @ 181.34 PnL 184.13 (Trailing Stop)
+2025-12-17 TSLA BUY 5 @ 467.26 PnL 0.00 (Golden Cross)
+2026-01-02 TSLA SELL 5 @ 438.07 PnL -145.95 (Trailing Stop)
+2026-01-15 NVDA BUY 12 @ 187.04 PnL 0.00 (Golden Cross)
+2026-01-16 AAPL SELL 4 @ 255.29 PnL 221.08 (Trailing Stop)
+2026-01-22 XLE SELL_PARTIAL 11 @ 48.59 PnL 90.03 (Partial Profit)
+2026-02-04 NVDA SELL 12 @ 174.18 PnL -154.31 (Stop-Loss)
+2026-02-23 AAPL BUY 10 @ 266.18 PnL 0.00 (Golden Cross)
+2026-03-06 NVDA BUY 10 @ 177.81 PnL 0.00 (Golden Cross)
+2026-03-13 AAPL SELL 10 @ 250.12 PnL -160.60 (Stop-Loss)
+2026-03-26 SPY SELL_END 2 @ 645.09 PnL 128.32 (End of backtest)
+2026-03-26 QQQ SELL_END 3 @ 573.79 PnL 182.05 (End of backtest)
+2026-03-26 XLE SELL_END 11 @ 61.52 PnL 232.23 (End of backtest)
+2026-03-26 NVDA SELL_END 10 @ 171.24 PnL -65.70 (End of backtest)
+2026-03-26 JNJ SELL_END 2 @ 239.24 PnL 171.04 (End of backtest)
