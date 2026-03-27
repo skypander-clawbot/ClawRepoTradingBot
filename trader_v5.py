@@ -79,9 +79,12 @@ def adx(df: pd.DataFrame, period: int) -> pd.Series:
     down = df["Low"].diff()
     plus_dm = np.where((up > down) & (up > 0), up, 0)
     minus_dm = np.where((down > up) & (down > 0), down, 0)
+    # Ensure same index as df
+    plus_dm = pd.Series(plus_dm, index=df.index)
+    minus_dm = pd.Series(minus_dm, index=df.index)
     tr = atr(df, period)
-    plus_di = 100 * (pd.Series(plus_dm).rolling(period).mean() / tr)
-    minus_di = 100 * (pd.Series(minus_dm).rolling(period).mean() / tr)
+    plus_di = 100 * (plus_dm.rolling(period).mean() / tr)
+    minus_di = 100 * (minus_dm.rolling(period).mean() / tr)
     dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
     adx_val = dx.rolling(period).mean()
     return adx_val
