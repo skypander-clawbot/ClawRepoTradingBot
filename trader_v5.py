@@ -48,7 +48,7 @@ CONFIG = {
     "trailing_atr_mult": 2.5,        # trailing = high – mult*ATR
     # --- Trend filter ---------------------------------------------------
     "adx_period": 14,
-    "adx_threshold": 25,
+    "adx_threshold": 20,
     # --- Pair trading ---------------------------------------------------
     "pair": ("SPY", "QQQ"),
     "pair_lookback_base": 20,
