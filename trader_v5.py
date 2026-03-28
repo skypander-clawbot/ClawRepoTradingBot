@@ -41,12 +41,12 @@ CONFIG = {
     "sma_long": 50,
     # --- Risk / sizing --------------------------------------------------
     "atr_period": 14,
-    "risk_per_trade": 0.01,          # 1% of equity per trade (vol‑adjusted)
+    "risk_per_trade": 0.02,          # 1% of equity per trade (vol‑adjusted)
     "max_equity_at_risk": 0.80,      # portfolio heat limit
     # --- Trade management -----------------------------------------------
-    "partial_profit_pct": 0.20,      # +20% → sell 50%
-    "initial_sl_atr_mult": 2.0,      # stop‑loss = entry – mult*ATR
-    "trailing_atr_mult": 2.5,        # trailing = high – mult*ATR
+    "partial_profit_pct": 0.25,      # +20% → sell 50%
+    "initial_sl_atr_mult": 2.5,      # stop‑loss = entry – mult*ATR
+    "trailing_atr_mult": 3.0,        # trailing = high – mult*ATR
     # --- Trend filter ---------------------------------------------------
     "adx_period": 14,
     "adx_threshold": 20,
