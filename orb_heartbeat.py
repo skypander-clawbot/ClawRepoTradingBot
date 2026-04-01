@@ -61,8 +61,8 @@ def should_run():
     if not (start_time <= current_time < end_time):
         return False
     
-    # Alle 30 Minuten laufen (Minute 00 oder 30)
-    return now.minute in [0, 30]
+    # Alle 15 Minuten laufen (Minute 00, 15, 30, 45)
+    return now.minute in [0, 15, 30, 45]
 
 def main():
     if should_run():
