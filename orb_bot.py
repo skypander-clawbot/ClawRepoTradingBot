@@ -23,7 +23,7 @@ ORB_CONFIG = {
     # ES=F/NQ=F: Require intraday data for proper ORB calculation - kept for future enhancement
     "symbols": [
         "SPY", "QQQ", "IWM", "DIA",  # Major ETFs (backtested)
-        "ES=F", "NQ=F",              # Futures (to be enhanced with intraday ORB)
+        "ES=F", "NQ=F", "MES=F", "MNQ=F",  # Futures + Micros
         "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA",  # Mega caps
         "NVDA", "META", "AMD", "NFLX"  # Tech leaders
     ],
@@ -34,6 +34,17 @@ ORB_CONFIG = {
     "opening_range_minutes": 30,  # First 30 minutes for ORB calculation
     "orb_breakout_multiplier": 1.0,  # Breakout threshold (1.0 = ORB high/low)
     "volume_multiplier": 1.3,  # Reduced from 1.5 for better signal frequency (especially for SPY)
+    # --- Futures-spezifische Einstellungen ------------------------------
+    "futures_config": {
+        "point_values": {      # Dollar pro Punkt
+            "ES=F": 50, "MES=F": 5,
+            "NQ=F": 20, "MNQ=F": 2,
+        },
+        "margin_per_contract": {   # ungefähre Intraday-Margin
+            "ES=F": 12000, "MES=F": 1200,
+            "NQ=F": 15000, "MNQ=F": 1500,
+        },
+    },
     # --- Risk Management ------------------------------------------------
     "risk_per_trade": 0.01,  # 1% of equity per trade (maintained for consistency)
     "max_daily_trades": 3,   # Reduced from 5 to focus on quality over quantity
@@ -224,20 +235,34 @@ class ORBPortfolio:
     def get_pos(self, sym: str) -> dict:
         return self.data["positions"].get(sym)
     
-    def calculate_position_size(self, entry_price: float, stop_loss: float, equity: float) -> int:
-        """Calculate position size based on risk per trade"""
+    def calculate_position_size(self, entry_price: float, stop_loss: float, equity: float, symbol: str = None) -> int:
+        """Universal position size – erkennt automatisch Futures"""
+        if symbol and symbol in self.cfg.get("futures_config", {}).get("point_values", {}):
+            return self._calculate_futures_position_size(symbol, entry_price, stop_loss, equity)
+        # Normaler Stock/ETF Modus
         risk_per_share = abs(entry_price - stop_loss)
         if risk_per_share <= 0:
             return 0
-        
         risk_amount = equity * self.cfg["risk_per_trade"]
         shares = int(risk_amount / risk_per_share)
-        
-        # Also limit by max equity at risk
         max_risk_amount = equity * self.cfg["max_equity_at_risk"]
         max_shares = int(max_risk_amount / risk_per_share) if risk_per_share > 0 else 0
-        
         return min(shares, max_shares)
+
+    def _calculate_futures_position_size(self, sym: str, entry_price: float, stop_loss: float, equity: float) -> int:
+        """Spezielle Berechnung für Futures (Kontrakte statt Shares)"""
+        point_value = self.cfg["futures_config"]["point_values"].get(sym, 1)
+        risk_per_point = abs(entry_price - stop_loss)
+        risk_dollar_per_contract = risk_per_point * point_value
+
+        risk_amount = equity * self.cfg["risk_per_trade"]
+        contracts = int(risk_amount / risk_dollar_per_contract) if risk_dollar_per_contract > 0 else 0
+
+        # Margin-Check (max. 30 % des Kapitals für Margin)
+        margin = self.cfg["futures_config"]["margin_per_contract"].get(sym, 10000)
+        max_contracts = int((equity * 0.3) / margin) if margin > 0 else 0
+
+        return min(contracts, max_contracts, 10)  # Sicherheits-Cap
     
     def buy(self, sym: str, price: float, shares: int, stop_loss: float, reason: str) -> dict:
         if shares <= 0:
@@ -499,7 +524,7 @@ class ORB_Bot:
                     if stop_loss >= current_price:
                         stop_loss = current_price - (1.0 * atr_value)  # Fallback to 1 ATR
                     
-                    shares = self.portfolio.calculate_position_size(current_price, stop_loss, self.portfolio.equity(price_dict))
+                    shares = self.portfolio.calculate_position_size(current_price, stop_loss, self.portfolio.equity(price_dict), symbol=sym)
                     
                     if shares > 0:
                         res = self.portfolio.buy(sym, current_price, shares, stop_loss, reason)
@@ -797,7 +822,7 @@ class ORB_Backtester:
                             stop_loss = current_price - atr_value
                         
                         shares = self.portfolio.calculate_position_size(
-                            current_price, stop_loss, self.portfolio.equity(price_dict)
+                            current_price, stop_loss, self.portfolio.equity(price_dict), symbol=sym
                         )
                         
                         if shares > 0:
