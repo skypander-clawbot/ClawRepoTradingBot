@@ -451,16 +451,17 @@ class ORB_Bot:
             
             # Generate new signals if we can trade
             elif self.portfolio.can_trade_today():
+                # Apply weekday filters first
+                current_weekday = datetime.now().weekday()  # Monday=0, Sunday=6
+                if self.cfg.get("avoid_fridays", False) and current_weekday == 4:  # Friday
+                    print(f"  {sym}: SKIPPED (Friday filter)")
+                    continue
+                if self.cfg.get("avoid_mondays", False) and current_weekday == 0:  # Monday
+                    print(f"  {sym}: SKIPPED (Monday filter)")
+                    continue
+                
                 signal, strength, reason, context = self.strategy.generate_signal(df)
                 if signal == "BUY" and strength > 0.3:  # Minimum strength threshold
-                    # Apply weekday filters
-                    current_weekday = datetime.now().weekday()  # Monday=0, Sunday=6
-                    if self.cfg.get("avoid_fridays", False) and current_weekday == 4:  # Friday
-                        print(f"  {sym}: SKIPPED (Friday filter)")
-                        continue
-                    if self.cfg.get("avoid_mondays", False) and current_weekday == 0:  # Monday
-                        print(f"  {sym}: SKIPPED (Monday filter)")
-                        continue
                     # Calculate stop loss based on ORB range or ATR
                     orb_high, orb_low, orb_range, _ = self.strategy.calculate_orb_levels(df)
                     atr_value = df["ATR"].iloc[-1] if not np.isnan(df["ATR"].iloc[-1]) else orb_range
@@ -553,6 +554,7 @@ class ORB_Bot:
             pos["trail_stop"] = current_price - trail_amount
             pos["highest"] = max(pos.get("highest", entry_price), current_price)
             print(f"  {sym}: TRAIL ACTIVATED @ {current_price:.2f} (Trail: {pos['trail_stop']:.2f})")
+            self.portfolio.save()  # Persist position changes
         
         # Update trailing stop if active
         if pos.get("trail_stop") is not None:
@@ -565,6 +567,7 @@ class ORB_Bot:
                 if new_trail_stop > pos["trail_stop"]:
                     pos["trail_stop"] = new_trail_stop
                     print(f"  {sym}: TRAIL UPDATE @ {current_price:.2f} (New Trail: {pos['trail_stop']:.2f})")
+                    self.portfolio.save()  # Persist position changes
             
             # Check if trailing stop is hit
             if current_price <= pos["trail_stop"]:
@@ -575,6 +578,7 @@ class ORB_Bot:
         
         # Update current price in position
         pos["price"] = current_price
+        self.portfolio.save()  # Persist position changes
     
     def _generate_daily_report(self, date_str: str, price_dict: dict, equity: float, signals: list):
         """Generate daily ORB bot report"""
