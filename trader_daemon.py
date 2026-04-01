@@ -41,13 +41,18 @@ def update_heartbeat(timestamp=None):
         if timestamp is None:
             timestamp = datetime.now().isoformat()
         
-        # Finde welche Zeit gerade war
+        # Determine which hour slot we are in (based on run_times)
         now = datetime.now()
-        current_time = now.strftime("%H:%M")
+        current_hour = now.hour
+        # Find the run_time that matches current hour (assuming minute 0)
+        matched_rt = None
         for rt in CONFIG["run_times"]:
-            if rt == current_time or (now.hour == int(rt.split(":")[0]) and now.minute == int(rt.split(":")[1])):
-                state["trader"]["lastRuns"][rt] = timestamp
+            rt_hour = int(rt.split(":")[0])
+            if rt_hour == current_hour:
+                matched_rt = rt
                 break
+        if matched_rt:
+            state["trader"]["lastRuns"][matched_rt] = timestamp
         
         with open(CONFIG["heartbeat_file"], "w") as f:
             json.dump(state, f, indent=2)

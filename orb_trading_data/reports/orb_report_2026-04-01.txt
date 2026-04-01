@@ -7,7 +7,7 @@ Current Equity:   10,000.00 EUR
 Daily Return:     +0.00%
 
 Signals Generated: 0
-Trades Today:      0/5
+Trades Today:      0/3
 Daily P&L:         +0.00 EUR
 
 Open Positions:
