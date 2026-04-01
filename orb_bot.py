@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import pytz
 
 # ============================= Configuration =============================
 ORB_CONFIG = {
@@ -185,6 +186,8 @@ class ORBPortfolio:
         return {
             "trades_today": 0,
             "pnl_today": 0.0,
+            "wins_today": 0,
+            "losses_today": 0,
             "win_rate_today": 0.0,
             "last_reset_date": None
         }
@@ -204,6 +207,8 @@ class ORBPortfolio:
             self.daily_stats = {
                 "trades_today": 0,
                 "pnl_today": 0.0,
+                "wins_today": 0,
+                "losses_today": 0,
                 "win_rate_today": 0.0,
                 "last_reset_date": today
             }
@@ -261,7 +266,7 @@ class ORBPortfolio:
         }
         self.data["positions"][sym] = pos
         self._log_trade(sym, "BUY", shares, price, 0.0, reason)
-        self._update_daily_stats("trade")
+        self._update_daily_stats("entry", 0.0)
         self.save()
         return {"ok": True, "pos": pos}
     
@@ -286,7 +291,7 @@ class ORBPortfolio:
             pass
         
         self._log_trade(sym, "SELL", shares, price, pnl, reason)
-        self._update_daily_stats("trade", pnl)
+        self._update_daily_stats("exit", pnl)
         self.save()
         return {"ok": True, "pnl": pnl, "remaining": pos.get("shares", 0)}
     
@@ -307,13 +312,19 @@ class ORBPortfolio:
         self._append_to_memory(f"**{datetime.now().strftime('%Y-%m-%d %H:%M')}** {sym} {action} {shares} @ {price:.2f} - P&L: {pnl:+.2f} ({reason})")
     
     def _update_daily_stats(self, action: str, pnl: float = 0.0):
-        if action == "trade":
-            self.daily_stats["trades_today"] += 1
         self.daily_stats["pnl_today"] += pnl  # Always update PnL
-        # Update win rate (simplified)
+        
+        if action == "entry":
+            self.daily_stats["trades_today"] += 1
+        
         if pnl > 0:
-            # Track wins/losses for win rate calculation
-            pass
+            self.daily_stats["wins_today"] += 1
+        elif pnl < 0:
+            self.daily_stats["losses_today"] += 1
+            
+        total_trades = self.daily_stats["wins_today"] + self.daily_stats["losses_today"]
+        self.daily_stats["win_rate_today"] = (self.daily_stats["wins_today"] / max(total_trades, 1)) * 100 if total_trades > 0 else 0.0
+        
         self._save_daily_stats()
     
     def _append_to_memory(self, content: str):
