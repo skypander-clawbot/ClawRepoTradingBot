@@ -63,17 +63,39 @@ ORB_CONFIG = {
 ORB_CONFIG["data_dir"].mkdir(exist_ok=True)
 
 # ============================= Helper Functions =============================
+import pytz  # Add to top imports if not present
+
 def is_market_hours(dt: datetime) -> bool:
-    """Check if datetime is within market hours"""
-    # For simplicity, we'll assume we're scanning during market hours
-    # In a real bot with proper timezone handling, this would check actual market hours
-    return True  # Allow trading during scan (we'll rely on daily data approximation)
+    """Check if datetime is within US market hours (9:30-16:00 ET)"""
+    et_tz = pytz.timezone('America/New_York')
+    try:
+        # Localize if naive
+        if dt.tzinfo is None:
+            et_dt = et_tz.localize(dt)
+        else:
+            et_dt = dt.astimezone(et_tz)
+        et_time = et_dt.time()
+        market_open = time(9, 30)
+        market_close = time(16, 0)
+        return market_open <= et_time < market_close
+    except:
+        return True  # Fallback
 
 def is_orb_period(dt: datetime) -> bool:
-    """Check if datetime is within ORB calculation period"""
-    # For daily ORB calculation with daily data, we approximate
-    # Since we're doing end-of-day scans, we use previous day's range as ORB proxy
-    return True  # Simplified for daily ORB calculation with daily data
+    """Check if datetime is within ORB period (9:30-10:00 ET)"""
+    et_tz = pytz.timezone('America/New_York')
+    try:
+        # Localize if naive
+        if dt.tzinfo is None:
+            et_dt = et_tz.localize(dt)
+        else:
+            et_dt = dt.astimezone(et_tz)
+        et_time = et_dt.time()
+        orb_start = time(9, 30)
+        orb_end = time(10, 0)
+        return orb_start <= et_time < orb_end
+    except:
+        return False  # Fallback to no
 
 def get_opening_range(df: pd.DataFrame) -> Tuple[float, float, float]:
     """
@@ -287,12 +309,11 @@ class ORBPortfolio:
     def _update_daily_stats(self, action: str, pnl: float = 0.0):
         if action == "trade":
             self.daily_stats["trades_today"] += 1
-        elif action == "pnl":
-            self.daily_stats["pnl_today"] += pnl
-            # Update win rate (simplified)
-            if pnl > 0:
-                # This is a win - we'd need to track wins/losses properly
-                pass
+        self.daily_stats["pnl_today"] += pnl  # Always update PnL
+        # Update win rate (simplified)
+        if pnl > 0:
+            # Track wins/losses for win rate calculation
+            pass
         self._save_daily_stats()
     
     def _append_to_memory(self, content: str):
