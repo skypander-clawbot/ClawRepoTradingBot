@@ -3,12 +3,12 @@
 Botti Trader – Redesign v5.0
 Trend‑following core with optional ML overlay, ATR‑based risk,
 dynamic trailing stops, enhanced pair‑trading, and expanded universe.
-Universe (18 assets):
+Universe (16 assets):
     SPY, QQQ, GLD, XLE, AAPL, TSLA, NVDA, JNJ,
     META, MU, CRWD, GOOGL, HOOD, PLTR, AMD, RKLB
 Features:
     - SMA 20/50 Golden/Death Cross (trend filter SMA20>SMA50)
-    - ADX > 25 filter for trend strength
+    - ADX > 20 filter for trend strength
     - Volatility‑adjusted position sizing (ATR based)
     - Partial profit at +20% (50% of position)
     - Initial stop‑loss 2*ATR
@@ -41,10 +41,10 @@ CONFIG = {
     "sma_long": 50,
     # --- Risk / sizing --------------------------------------------------
     "atr_period": 14,
-    "risk_per_trade": 0.02,          # 1% of equity per trade (vol‑adjusted)
+    "risk_per_trade": 0.02,          # 2% of equity per trade (vol‑adjusted)
     "max_equity_at_risk": 0.80,      # portfolio heat limit
     # --- Trade management -----------------------------------------------
-    "partial_profit_pct": 0.25,      # +20% → sell 50%
+    "partial_profit_pct": 0.25,      # +25% → sell 50%
     "initial_sl_atr_mult": 2.5,      # stop‑loss = entry – mult*ATR
     "trailing_atr_mult": 3.0,        # trailing = high – mult*ATR
     # --- Trend filter ---------------------------------------------------
@@ -79,7 +79,7 @@ def adx(df: pd.DataFrame, period: int) -> pd.Series:
     up = df["High"].diff()
     down = df["Low"].diff()
     plus_dm = np.where((up > down) & (up > 0), up, 0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0)
+    minus_dm = np.where((down > up) & (down > 0), -down, 0)
     # Ensure same index as df
     plus_dm = pd.Series(plus_dm, index=df.index)
     minus_dm = pd.Series(minus_dm, index=df.index)
@@ -145,11 +145,12 @@ class Portfolio:
             "trades": [],
             "equity_curve": [],
         }
-    def save(self):
+    def save(self, price_dict: dict = None):
+        positions_val = sum(p["shares"] * price_dict.get(p["symbol"], p["price"]) for p in self.data["positions"].values()) if price_dict else sum(p["shares"]*p["price"] for p in self.data["positions"].values())
         self.data["equity_curve"].append({
             "date": datetime.now().isoformat(),
             "cash": self.data["cash"],
-            "positions_value": sum(p["shares"]*p["price"] for p in self.data["positions"].values()),
+            "positions_value": positions_val,
         })
         self.data["last_updated"] = datetime.now().isoformat()
         with open(self.cfg["portfolio_file"], "w") as f:
@@ -270,8 +271,8 @@ class Strategy:
     def ml_prob(self, features: dict) -> float:
         if self.ml_model is None or self.ml_scaler is None:
             return 0.5
-        # order: sma_diff, adx, atr_pct, rsi_norm
-        X = np.array([[features['sma_diff'], features['adx'], features['atr_pct'], features['rsi_norm']]])
+        # order: sma_diff, adx, atr_pct, rsi (match run_daily feats)
+        X = np.array([[features['sma_diff'], features['adx'], features['atr_pct'], features['rsi']]])
         X_scaled = self.ml_scaler.transform(X)
         prob = self.ml_model.predict_proba(X_scaled)[0, 1]  # probability of class 1
         return float(prob)
@@ -291,7 +292,8 @@ class Trader:
                     cost = price * shares
                     if cost <= self.portfolio.data["cash"]:
                         self.portfolio.data["cash"] -= cost
-                        atr_val = 0.0  # we could compute ATR but skip for seed
+                        df_seed = compute_indicators(nvda_df)
+                        atr_val = df_seed["ATR"].iloc[-1] if not np.isnan(df_seed["ATR"].iloc[-1]) else 0.0  # Compute real ATR
                         pos = {
                             "symbol": "NVDA",
                             "shares": shares,
@@ -338,9 +340,11 @@ class Trader:
         return df[["Open","High","Low","Close","Volume"]]
     def fetch_pair(self) -> pd.DataFrame:
         sym1, sym2 = self.cfg["pair"]
-        df = yf.download([sym1, sym2], period="400d")["Close"]
-        if isinstance(df, pd.Series):
-            df = df.to_frame(name=sym1)
+        df = yf.download([sym1, sym2], period="400d")
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df["Close"]
+        else:
+            df = df[[sym1, sym2]]
         return df
     # -----------------------------------------------------------------
     def run_daily(self) -> dict:
@@ -348,17 +352,25 @@ class Trader:
         print(f"\n=== Botti Trader v5.0 – {today} ===")
         # 1) update prices & manage exits
         price_dict = {}
+        sym_to_df = {}
+        current_risk = 0.0
         for sym in self.cfg["symbols"]:
             df = self.fetch_data(sym, period="100d")
             if df.empty:
                 continue
             df = compute_indicators(df)
+            sym_to_df[sym] = df
             price = df["Close"].iloc[-1]
             price_dict[sym] = price
             atr_val = df["ATR"].iloc[-1] if not np.isnan(df["ATR"].iloc[-1]) else 0.0
             # manage existing positions
             if self.portfolio.has_pos(sym):
                 pos = self.portfolio.get_pos(sym)
+                # update price early
+                pos["price"] = price
+                # update current risk
+                risk_this = pos["shares"] * (pos["entry"] - pos["stop"])
+                current_risk += max(risk_this, 0.0)
                 # update highest & trailing
                 if price > pos["highest"]:
                     pos["highest"] = price
@@ -388,18 +400,20 @@ class Trader:
                     if res["ok"]:
                         print(f"  {sym}: STOP-LOSS SELL {pos['shares']} @ {price:.2f} (PNL {res['pnl']:.2f})")
                         exited = True
-                # update price in pos dict
-                pos["price"] = price
         # 2) generate new signals
         for sym in self.cfg["symbols"]:
             if self.portfolio.has_pos(sym):
                 continue  # already have position
-            df = self.fetch_data(sym, period="100d")
-            if df.empty or len(df) < self.cfg["sma_long"] + 5:
+            df = sym_to_df.get(sym)
+            if df is None or df.empty or len(df) < self.cfg["sma_long"] + 5:
                 continue
-            df = compute_indicators(df)
             signal, reason = self.strategy.signal_row(df)
             if signal == "BUY":
+                # check portfolio heat
+                equity = self.portfolio.equity(price_dict)
+                if current_risk > equity * self.cfg["max_equity_at_risk"]:
+                    print(f"  {sym}: SKIPPED BUY - Portfolio heat limit reached ({current_risk/equity*100:.1f}% > {self.cfg['max_equity_at_risk']*100:.0f}%)")
+                    continue
                 # volatility‑adjusted size
                 atr_val = df["ATR"].iloc[-1]
                 risk_per_share = self.cfg["initial_sl_atr_mult"] * atr_val  # approximate $ risk if SL hit
@@ -436,6 +450,7 @@ class Trader:
             print(f"  Pair {self.cfg['pair'][0]}/{self.cfg['pair'][1]}: {pair_signal} (Z={z:.2f}) – {reason}")
         # 4) equity & reporting
         equity = self.portfolio.equity(price_dict)
+        self.portfolio.save(price_dict)
         init = self.cfg["initial_capital"]
         ret = (equity / init - 1) * 100
         print(f"  Equity: {equity:,.2f} {self.cfg['currency']} (Return {ret:+.2f}%)")
