@@ -1,0 +1,17 @@
+============================================================
+BOTTI TRADER v5.0 – DAILY REPORT – 2026-04-02
+============================================================
+
+Starting Capital: 10,000.00 EUR
+Current Equity:   10,010.16 EUR
+Return:           +0.10%
+
+Open Positions:
+  CRWD: 4 sh @ 385.39 → now 400.11 | SL 341.52 | Trail 347.46 | Full
+
+Recent Trades (last 10):
+  2026-03-27T23:41 NVDA BUY 6 @ 175.64 P&L +0.00 (Seed position)
+  2026-03-27T23:41 NVDA SELL 6 @ 167.52 P&L -48.72 (Trailing Stop)
+  2026-03-31T15:48 CRWD BUY 4 @ 385.39 P&L +0.00 (Golden Cross)
+
+============================================================

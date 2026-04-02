@@ -1,0 +1,6 @@
+ORB_Backtester – Full Report
+============================================================
+Zeitraum: 2024-01-01 – 2025-04-01
+Symbole: SPY, QQQ, IWM, DIA, ES=F, NQ=F, AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA, META, AMD, NFLX
+
+Trades:

@@ -1,0 +1,70 @@
+{
+  "cash": 8409.719970703125,
+  "initial_capital": 10000.0,
+  "positions": {
+    "CRWD": {
+      "symbol": "CRWD",
+      "shares": 4,
+      "entry": 385.3900146484375,
+      "atr_at_entry": 17.54917253766741,
+      "highest": 400.1099853515625,
+      "stop": 341.51708330426897,
+      "trailing": 347.4624677385603,
+      "partial_sold": false,
+      "reason": "Golden Cross",
+      "price": 400.1099853515625
+    }
+  },
+  "trades": [
+    {
+      "time": "2026-03-27T23:41:19.347648",
+      "symbol": "NVDA",
+      "action": "BUY",
+      "shares": 6,
+      "price": 175.63999938964844,
+      "pnl": 0.0,
+      "reason": "Seed position"
+    },
+    {
+      "time": "2026-03-27T23:41:20.344625",
+      "symbol": "NVDA",
+      "action": "SELL",
+      "shares": 6,
+      "price": 167.52000427246094,
+      "pnl": -48.719970703125,
+      "reason": "Trailing Stop"
+    },
+    {
+      "time": "2026-03-31T15:48:38.921679",
+      "symbol": "CRWD",
+      "action": "BUY",
+      "shares": 4,
+      "price": 385.3900146484375,
+      "pnl": 0.0,
+      "reason": "Golden Cross"
+    }
+  ],
+  "equity_curve": [
+    {
+      "date": "2026-03-27T23:41:19.347657",
+      "cash": 8946.16000366211,
+      "positions_value": 1053.8399963378906
+    },
+    {
+      "date": "2026-03-27T23:41:20.344636",
+      "cash": 9951.280029296875,
+      "positions_value": 0
+    },
+    {
+      "date": "2026-03-31T15:48:38.921688",
+      "cash": 8409.719970703125,
+      "positions_value": 1541.56005859375
+    },
+    {
+      "date": "2026-04-02T16:37:56.808460",
+      "cash": 8409.719970703125,
+      "positions_value": 1600.43994140625
+    }
+  ],
+  "last_updated": "2026-04-02T16:37:56.808484"
+}

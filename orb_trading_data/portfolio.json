@@ -1,0 +1,33 @@
+{
+  "cash": 846.1597900390625,
+  "initial_capital": 10000.0,
+  "positions": {
+    "AMD": {
+      "symbol": "AMD",
+      "shares": 43,
+      "entry": 212.8800048828125,
+      "stop_loss": 210.56421279907227,
+      "price": 212.8800048828125,
+      "highest": 212.8800048828125,
+      "trail_stop": null,
+      "reason": "ORB Breakout: 212.88 > 206.87 (ORB High)",
+      "entry_time": "2026-04-02T17:07:09.329220",
+      "unrealized_pnl": 0.0
+    }
+  },
+  "trades": [
+    {
+      "time": "2026-04-02T17:07:09.329224",
+      "symbol": "AMD",
+      "action": "BUY",
+      "shares": 43,
+      "price": 212.8800048828125,
+      "pnl": 0.0,
+      "reason": "ORB Breakout: 212.88 > 206.87 (ORB High)",
+      "strategy": "ORB"
+    }
+  ],
+  "equity_curve": [],
+  "daily_pnl": {},
+  "last_updated": "2026-04-02T17:07:09.329650"
+}
