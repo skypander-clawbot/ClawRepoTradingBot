@@ -1,945 +1,1124 @@
 #!/usr/bin/env python3
 """
-ORB_Bot - Opening Range Breakout Strategy
-Independent day trading bot focusing on ORB strategy
+ORB_Bot – Opening Range Breakout Strategy
+Alpaca Markets Edition: Daten + Orderausführung via alpaca-py
+OpenClaw-kompatibel: läuft als CLI-Skript, Keys aus Umgebungsvariablen
+
+Installation:
+    pip install alpaca-py pytz pandas numpy
+
+Umgebungsvariablen (OpenClaw setzt diese automatisch):
+    APCA_API_KEY_ID      – Alpaca API Key
+    APCA_API_SECRET_KEY  – Alpaca Secret Key
+    APCA_PAPER           – "true" für Paper Trading (Standard), "false" für Live
+    APCA_DATA_FEED       – "iex" (kostenlos, Standard) oder "sip" (Echtzeit, kostenpflichtig)
+
+OpenClaw-Befehle:
+    python orb_bot.py --mode scan        # Signalsuche + Orderausführung
+    python orb_bot.py --mode status      # Portfolio-Status (JSON-Ausgabe)
+    python orb_bot.py --mode eod         # Alle Positionen schließen
+    python orb_bot.py --mode backtest    # Historischen Backtest laufen lassen
+
+Hinweis zu Futures (ES=F, NQ=F etc.):
+    Alpaca unterstützt keine Futures. Diese Symbole werden in symbols_watchonly
+    geführt – Signale werden generiert, aber keine Orders ausgeführt.
 """
 
 import json
 import os
-from datetime import datetime, time
+import sys
+import argparse
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import pytz
+import time as time_module
 
-# ============================= Configuration =============================
-import os
-from pathlib import Path
+# ── Alpaca-py (pip install alpaca-py) ──────────────────────────────────────
+try:
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import (
+        MarketOrderRequest,
+        GetOrdersRequest,
+        StopLossRequest,
+        TakeProfitRequest,
+    )
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    ALPACA_AVAILABLE = True
+except ImportError:
+    ALPACA_AVAILABLE = False
+    print("[WARN] alpaca-py fehlt → pip install alpaca-py", file=sys.stderr)
 
-TELEGRAM_TOKEN_PATH = Path.home() / ".secrets" / "telegram.token"
+# ============================= Konfiguration ================================
+
+TELEGRAM_TOKEN_PATH  = Path.home() / ".secrets" / "telegram.token"
 TELEGRAM_CHAT_ID_PATH = Path.home() / ".secrets" / "telegram.chat_id"
 
-def send_telegram(message: str) -> None:
-    """Send a message via Telegram bot."""
-    try:
-        token = TELEGRAM_TOKEN_PATH.read_text().strip()
-        chat_id = TELEGRAM_CHAT_ID_PATH.read_text().strip()
-        import urllib.request
-        import urllib.parse
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode()
-        req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
-    except Exception as e:
-        # Fail silently to not break trading logic
-        print(f"[Telegram] Failed to send message: {e}")
-
 ORB_CONFIG = {
-    # --- Universe for day trading (liquid stocks/ETFs) ------------------
-    # Based on backtest results (2024-01-01 to 2026-03-31):
-    # QQQ: 70% Win Rate, 10.26% Return, PF ∞ (best performer)
-    # SPY: 53.8% Win Rate, 5.95% Return, PF 2.44 (solid performer)
-    # ES=F/NQ=F: Require intraday data for proper ORB calculation - kept for future enhancement
+    # ── Handelbare Symbole via Alpaca (Stocks + ETFs) ──────────────────────
     "symbols": [
-        "SPY", "QQQ", "IWM", "DIA",  # Major ETFs (backtested)
-        "ES=F", "NQ=F", "MES=F", "MNQ=F",  # Futures + Micros
-        "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA",  # Mega caps
-        "NVDA", "META", "AMD", "NFLX"  # Tech leaders
+        "SPY", "QQQ", "IWM", "DIA",
+        "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA",
+        "NVDA", "META", "AMD", "NFLX",
     ],
-    # --- ORB Strategy Parameters ----------------------------------------
-    # Optimized based on backtest results (2024-01-01 to 2026-03-31):
-    # QQQ showed 70% Win Rate, 10.26% Return - favorable for ORB
-    # SPY showed 53.8% Win Rate, 5.95% Return - solid but less volatile
-    "opening_range_minutes": 30,  # First 30 minutes for ORB calculation
-    "orb_breakout_multiplier": 1.0,  # Breakout threshold (1.0 = ORB high/low)
-    "volume_multiplier": 1.3,  # Reduced from 1.5 for better signal frequency (especially for SPY)
-    # --- Futures-spezifische Einstellungen ------------------------------
-    "futures_config": {
-        "point_values": {      # Dollar pro Punkt
-            "ES=F": 50, "MES=F": 5,
-            "NQ=F": 20, "MNQ=F": 2,
-        },
-        "margin_per_contract": {   # ungefähre Intraday-Margin
-            "ES=F": 12000, "MES=F": 1200,
-            "NQ=F": 15000, "MNQ=F": 1500,
-        },
-    },
-    # --- Risk Management ------------------------------------------------
-    "risk_per_trade": 0.01,  # 1% of equity per trade (maintained for consistency)
-    "max_daily_trades": 3,   # Reduced from 5 to focus on quality over quantity
-    "max_equity_at_risk": 0.05,  # 5% max portfolio risk at any time
-    # --- Trade Management -----------------------------------------------
-    "profit_target_r": 2.0,  # Profit target in R multiples (maintained)
-    "stop_loss_r": 1.0,  # Stop loss in R multiples (maintained)
-    "trail_after_r": 1.0,  # Start trailing after 1R profit (maintained)
-    "trail_distance_r": 0.5,  # Trail distance in R multiples (maintained)
-    # --- Market Hours (ET) ----------------------------------------------
-    "market_open": time(9, 30),  # 9:30 AM ET
-    "market_close": time(16, 0),  # 4:00 PM ET
-    "orb_end_time": time(10, 0),  # 10:00 AM ET (30 min after open)
-    # --- Misc -----------------------------------------------------------
-    "currency": "EUR",
-    "initial_capital": 10000.0,
-    "data_dir": Path(__file__).parent / "orb_trading_data",
-    "portfolio_file": Path(__file__).parent / "orb_trading_data" / "portfolio.json",
-    "memory_file": Path(__file__).parent / "orb_trading_data" / "memory.md",
+    # ── Nur Signal, keine Ausführung (Alpaca unterstützt keine Futures) ────
+    "symbols_watchonly": ["ES=F", "NQ=F", "MES=F", "MNQ=F"],
+
+    # ── ORB-Parameter ──────────────────────────────────────────────────────
+    "opening_range_minutes": 30,
+    "orb_breakout_multiplier": 1.0,
+    "volume_multiplier": 1.3,
+
+    # ── Risiko-Management ──────────────────────────────────────────────────
+    "risk_per_trade":    0.01,   # 1 % des Eigenkapitals pro Trade
+    "max_daily_trades":  3,
+    "max_equity_at_risk": 0.05,  # max. 5 % Gesamtrisiko gleichzeitig
+
+    # ── Trade-Management ───────────────────────────────────────────────────
+    "profit_target_r": 2.0,      # Take-Profit in R-Vielfachen
+    "stop_loss_r":     1.0,      # Stop-Loss  in R-Vielfachen
+    # Trailing Stop: wird als separater Alpaca-Aufruf gesetzt, sobald
+    # Bracket-Order gefüllt ist (optional, see _activate_trailing_stop)
+    "trail_after_r":    1.0,
+    "trail_distance_r": 0.5,
+
+    # ── Short-Seite ────────────────────────────────────────────────────────
+    # Alpaca benötigt ein Margin-Konto für Shorts auf Stocks/ETFs.
+    # Futures-Shorts werden über symbols_watchonly ohnehin nicht ausgeführt.
+    "allow_shorts": False,
+
+    # ── Marktzeiten (ET) ───────────────────────────────────────────────────
+    "market_open":  time(9, 30),
+    "market_close": time(16, 0),
+    "orb_end_time": time(10, 0),
+
+    # ── Alpaca-Verbindung ──────────────────────────────────────────────────
+    # Werte aus Umgebungsvariablen; hier als Fallback-Defaults
+    "alpaca_paper":     True,    # überschrieben durch APCA_PAPER env-var
+    "alpaca_data_feed": "iex",   # "iex" = kostenlos | "sip" = Echtzeit (kostenpflichtig)
+
+    # ── Filter ─────────────────────────────────────────────────────────────
+    "avoid_fridays": True,
+    "avoid_mondays": False,
+
+    # ── Lokale Dateien ─────────────────────────────────────────────────────
+    "currency":  "USD",
+    "data_dir":         Path(__file__).parent / "orb_trading_data",
+    "portfolio_file":   Path(__file__).parent / "orb_trading_data" / "portfolio.json",
+    "memory_file":      Path(__file__).parent / "orb_trading_data" / "memory.md",
     "daily_stats_file": Path(__file__).parent / "orb_trading_data" / "daily_stats.json",
-    # --- Trading Filters ----------------------------------------------
-    "avoid_fridays": True,        # Avoid trading on Fridays (often lower quality)
-    "avoid_mondays": False,       # Avoid trading on Mondays (can be gap-sensitive)
-    "allowed_weekdays": [0, 1, 2, 3, 4],  # Monday=0, Sunday=6 (default: all weekdays)
 }
 
-# Ensure directories exist
 ORB_CONFIG["data_dir"].mkdir(exist_ok=True)
 
-# ============================= Helper Functions =============================
-import pytz  # Add to top imports if not present
+
+# ============================= Telegram =====================================
+
+def send_telegram(message: str) -> None:
+    try:
+        token   = TELEGRAM_TOKEN_PATH.read_text().strip()
+        chat_id = TELEGRAM_CHAT_ID_PATH.read_text().strip()
+        import urllib.request, urllib.parse
+        url  = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode()
+        urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10).read()
+    except Exception as e:
+        print(f"[Telegram] {e}")
+
+
+# ============================= Helper =======================================
 
 def is_market_hours(dt: datetime) -> bool:
-    """Check if datetime is within US market hours (9:30-16:00 ET)"""
-    et_tz = pytz.timezone('America/New_York')
+    et = pytz.timezone("America/New_York")
     try:
-        # Localize if naive
-        if dt.tzinfo is None:
-            et_dt = et_tz.localize(dt)
-        else:
-            et_dt = dt.astimezone(et_tz)
-        et_time = et_dt.time()
-        market_open = time(9, 30)
-        market_close = time(16, 0)
-        return market_open <= et_time < market_close
-    except:
-        return True  # Fallback
+        et_dt = et.localize(dt) if dt.tzinfo is None else dt.astimezone(et)
+        return time(9, 30) <= et_dt.time() < time(16, 0)
+    except Exception:
+        return True
+
+def is_trading_day(dt: datetime = None) -> bool:
+    return (dt or datetime.now()).weekday() < 5
 
 def is_orb_period(dt: datetime) -> bool:
-    """Check if datetime is within ORB period (9:30-10:00 ET)"""
-    et_tz = pytz.timezone('America/New_York')
+    et = pytz.timezone("America/New_York")
     try:
-        # Localize if naive
-        if dt.tzinfo is None:
-            et_dt = et_tz.localize(dt)
-        else:
-            et_dt = dt.astimezone(et_tz)
-        et_time = et_dt.time()
-        orb_start = time(9, 30)
-        orb_end = time(10, 0)
-        return orb_start <= et_time < orb_end
-    except:
-        return False  # Fallback to no
+        et_dt = et.localize(dt) if dt.tzinfo is None else dt.astimezone(et)
+        return time(9, 30) <= et_dt.time() < time(10, 0)
+    except Exception:
+        return False
 
 def get_opening_range(df: pd.DataFrame) -> Tuple[float, float, float]:
-    """
-    Calculate Opening Range from intraday data (first 30 minutes AFTER market open TODAY)
-    Returns: (ORB_high, ORB_low, ORB_range)
-    """
     if df.empty or len(df) < 6:
         return 0.0, 0.0, 0.0
-
-    # Saubere Zeitzonen-Behandlung (funktioniert immer)
     df = df.copy()
     df.index = pd.to_datetime(df.index)
     if df.index.tz is None:
-        df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
+        df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
     else:
-        df = df.tz_convert('America/New_York')
-
-    # Letzten vollständigen Trading-Tag finden (wichtig für Backtesting!)
-    # Wir nehmen den letzten Tag, an dem mindestens 30 Minuten gehandelt wurden
-    df['date'] = df.index.date
-    daily_counts = df.groupby('date').size()
-    valid_days = daily_counts[daily_counts >= 6] # mind. 6 Bars = 30 Min
-    
-    if valid_days.empty:
-        # Ultimativer Fallback
-        last_bar = df.iloc[-1]
-        return last_bar["High"], last_bar["Low"], last_bar["High"] - last_bar["Low"]
-
-    # Heutiger (oder letzter gültiger) ORB-Tag
-    orb_date = valid_days.index[-1]
-    orb_df = df[df['date'] == orb_date]
-    
-    # Nur 9:30–10:00 ET
-    orb_mask = (orb_df.index.hour * 100 + orb_df.index.minute >= 930) & (orb_df.index.hour * 100 + orb_df.index.minute < 1000)
-    orb_period = orb_df[orb_mask]
-
-    if len(orb_period) >= 2:
-        return orb_period["High"].max(), orb_period["Low"].min(), orb_period["High"].max() - orb_period["Low"].min()
-
-    # Fallback: ganzer letzter Tag als Proxy
-    last_day = orb_df.iloc[-1]
-    return last_day["High"], last_day["Low"], last_day["High"] - last_day["Low"]
+        df.index = df.index.tz_convert("America/New_York")
+    df["date"] = df.index.date
+    valid = df.groupby("date").size()
+    valid = valid[valid >= 6]
+    if valid.empty:
+        b = df.iloc[-1]
+        return b["High"], b["Low"], b["High"] - b["Low"]
+    orb_df = df[df["date"] == valid.index[-1]]
+    hhmm   = orb_df.index.hour * 100 + orb_df.index.minute
+    period = orb_df[(hhmm >= 930) & (hhmm < 1000)]
+    if len(period) >= 2:
+        h, l = period["High"].max(), period["Low"].min()
+        return h, l, h - l
+    b = orb_df.iloc[-1]
+    return b["High"], b["Low"], b["High"] - b["Low"]
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculate Average True Range"""
-    high_low = df["High"] - df["Low"]
-    high_close = np.abs(df["High"] - df["Close"].shift())
-    low_close = np.abs(df["Low"] - df["Close"].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    hl  = df["High"] - df["Low"]
+    hc  = np.abs(df["High"] - df["Close"].shift())
+    lc  = np.abs(df["Low"]  - df["Close"].shift())
+    return pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(period).mean()
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute technical indicators for ORB strategy"""
     df = df.copy()
-    df["ATR"] = calculate_atr(df)
-    # Volume indicators
+    df["ATR"]       = calculate_atr(df)
     df["Volume_MA"] = df["Volume"].rolling(20).mean()
     df["Volume_Ratio"] = df["Volume"] / df["Volume_MA"]
     return df
 
-# ============================= Portfolio Management =============================
+
+# ============================= AlpacaClient =================================
+
+class AlpacaClient:
+    """
+    Zentrale Klasse für alle Alpaca-Interaktionen.
+    Trennt sauber zwischen Datenabruf (StockHistoricalDataClient)
+    und Orderausführung (TradingClient).
+    """
+
+    def __init__(self, api_key: str, secret_key: str,
+                 paper: bool = True, data_feed: str = "iex"):
+        if not ALPACA_AVAILABLE:
+            raise RuntimeError("alpaca-py fehlt – pip install alpaca-py")
+        self.paper     = paper
+        self.data_feed = data_feed
+        self.trading   = TradingClient(api_key=api_key, secret_key=secret_key, paper=paper)
+        self.data      = StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
+        mode = "PAPER" if paper else "LIVE ⚠️"
+        print(f"[Alpaca] Verbunden  Modus={mode}  Feed={data_feed}")
+
+    # ── Marktdaten ──────────────────────────────────────────────────────────
+
+    def fetch_bars(self, symbol: str, days: int = 5) -> pd.DataFrame:
+        """5m-Bars für ein Symbol – ersetzt yfinance.fetch_intraday_data()."""
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Minute5,
+                start=datetime.now(pytz.UTC) - timedelta(days=days),
+                end=datetime.now(pytz.UTC),
+                adjustment="raw",
+                feed=self.data_feed,
+            )
+            bars = self.data.get_stock_bars(req)
+            if bars.df.empty:
+                return pd.DataFrame()
+            df = bars.df.loc[symbol].copy() if isinstance(bars.df.index, pd.MultiIndex) \
+                 else bars.df.copy()
+            return self._rename(df)
+        except Exception as e:
+            print(f"[Alpaca] Datenfehler {symbol}: {e}")
+            return pd.DataFrame()
+
+    def fetch_bars_bulk(self, symbols: List[str],
+                        start: str, end: str) -> Dict[str, pd.DataFrame]:
+        """
+        Historische 5m-Bars für mehrere Symbole auf einmal.
+        Ersetzt yfinance._download_chunked_5m() im Backtester.
+        Alpaca hat kein 60-Tage-Limit wie yfinance → kein Chunking nötig.
+        """
+        result: Dict[str, pd.DataFrame] = {}
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=symbols,
+                timeframe=TimeFrame.Minute5,
+                start=datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=pytz.UTC),
+                end=datetime.strptime(end,   "%Y-%m-%d").replace(tzinfo=pytz.UTC),
+                adjustment="raw",
+                feed=self.data_feed,
+            )
+            bars = self.data.get_stock_bars(req)
+            if bars.df.empty:
+                return result
+            for sym in symbols:
+                try:
+                    result[sym] = self._rename(bars.df.loc[sym].copy())
+                    print(f"  ✓ {sym}: {len(result[sym])} Bars")
+                except KeyError:
+                    print(f"  ✗ {sym}: keine Daten")
+        except Exception as e:
+            print(f"[Alpaca] Bulk-Fehler: {e}")
+        return result
+
+    @staticmethod
+    def _rename(df: pd.DataFrame) -> pd.DataFrame:
+        """Alpaca-Spaltennamen → OHLCV-Standard."""
+        return df.rename(columns={
+            "open": "Open", "high": "High", "low": "Low",
+            "close": "Close", "volume": "Volume",
+        })[["Open", "High", "Low", "Close", "Volume"]]
+
+    # ── Account & Positionen ────────────────────────────────────────────────
+
+    def get_equity(self) -> float:
+        try:
+            return float(self.trading.get_account().equity)
+        except Exception as e:
+            print(f"[Alpaca] Equity-Fehler: {e}")
+            return 0.0
+
+    def get_cash(self) -> float:
+        try:
+            return float(self.trading.get_account().cash)
+        except Exception:
+            return 0.0
+
+    def get_buying_power(self) -> float:
+        try:
+            return float(self.trading.get_account().buying_power)
+        except Exception:
+            return 0.0
+
+    def sync_positions(self) -> Dict[str, dict]:
+        """
+        Aktuelle Positionen direkt von Alpaca holen.
+        Gibt Wahrheit über offene Positionen – verhindert Doppel-Entries.
+        """
+        try:
+            positions = self.trading.get_all_positions()
+            return {
+                p.symbol: {
+                    "symbol":          p.symbol,
+                    "qty":             float(p.qty),
+                    "side":            p.side.value,        # "long" | "short"
+                    "entry":           float(p.avg_entry_price),
+                    "current_price":   float(p.current_price),
+                    "unrealized_pnl":  float(p.unrealized_pl),
+                    "market_value":    float(p.market_value),
+                }
+                for p in positions
+            }
+        except Exception as e:
+            print(f"[Alpaca] Positions-Fehler: {e}")
+            return {}
+
+    def is_shortable(self, symbol: str) -> bool:
+        """Prüft ob Alpaca das Symbol für Shorts freigibt."""
+        try:
+            asset = self.trading.get_asset(symbol)
+            return bool(asset.shortable) and bool(asset.easy_to_borrow)
+        except Exception:
+            return False
+
+    def get_open_orders(self) -> List[dict]:
+        try:
+            req    = GetOrdersRequest(status="open", limit=50)
+            orders = self.trading.get_orders(req)
+            return [{"id": str(o.id), "symbol": o.symbol,
+                     "side": o.side.value, "qty": float(o.qty),
+                     "status": o.status.value} for o in orders]
+        except Exception as e:
+            print(f"[Alpaca] Orders-Fehler: {e}")
+            return []
+
+    # ── Orderausführung ─────────────────────────────────────────────────────
+
+    def place_long_bracket(self, symbol: str, qty: int,
+                            stop_loss: float, take_profit: float) -> Optional[dict]:
+        """
+        Long-Entry als Bracket-Order.
+        Alpaca verwaltet Stop-Loss und Take-Profit serverseitig –
+        _manage_position() im Bot ist für Live-Trades nicht nötig.
+        """
+        try:
+            order = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                stop_loss=StopLossRequest(stop_price=round(stop_loss,    2)),
+                take_profit=TakeProfitRequest(limit_price=round(take_profit, 2)),
+            )
+            r = self.trading.submit_order(order)
+            print(f"[Alpaca] LONG  {symbol} {qty} Aktien | SL {stop_loss:.2f} | TP {take_profit:.2f} → {r.status.value}")
+            return {"id": str(r.id), "symbol": symbol, "qty": qty,
+                    "side": "long", "stop_loss": stop_loss,
+                    "take_profit": take_profit, "status": r.status.value}
+        except Exception as e:
+            print(f"[Alpaca] Long-Order {symbol} fehlgeschlagen: {e}")
+            return None
+
+    def place_short_bracket(self, symbol: str, qty: int,
+                             stop_loss: float, take_profit: float) -> Optional[dict]:
+        """
+        Short-Entry als Bracket-Order.
+        stop_loss liegt ÜBER dem Entry, take_profit DARUNTER.
+        Erfordert Margin-Konto + Shortability-Check.
+        """
+        if not self.is_shortable(symbol):
+            print(f"[Alpaca] {symbol} nicht shortbar – Order abgebrochen")
+            return None
+        try:
+            order = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,          # Sell-to-Open = Short
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                stop_loss=StopLossRequest(stop_price=round(stop_loss,    2)),
+                take_profit=TakeProfitRequest(limit_price=round(take_profit, 2)),
+            )
+            r = self.trading.submit_order(order)
+            print(f"[Alpaca] SHORT {symbol} {qty} Aktien | SL {stop_loss:.2f} | TP {take_profit:.2f} → {r.status.value}")
+            return {"id": str(r.id), "symbol": symbol, "qty": qty,
+                    "side": "short", "stop_loss": stop_loss,
+                    "take_profit": take_profit, "status": r.status.value}
+        except Exception as e:
+            print(f"[Alpaca] Short-Order {symbol} fehlgeschlagen: {e}")
+            return None
+
+    def cancel_all_orders(self) -> None:
+        try:
+            self.trading.cancel_orders()
+            print("[Alpaca] Alle offenen Orders storniert")
+        except Exception as e:
+            print(f"[Alpaca] Stornierungsfehler: {e}")
+
+    def close_all_positions(self) -> None:
+        """EOD: alle Positionen schließen + offene Orders stornieren."""
+        try:
+            self.trading.close_all_positions(cancel_orders=True)
+            print("[Alpaca] Alle Positionen geschlossen (EOD)")
+        except Exception as e:
+            print(f"[Alpaca] EOD-Close Fehler: {e}")
+
+
+# ============================= Portfolio-Ledger =============================
+# Im Live-Betrieb dient ORBPortfolio nur noch als lokales Log + Tagesstatistik.
+# Die eigentliche Positionsverwaltung übernimmt Alpaca (Bracket-Orders).
+# Für den Backtester bleibt die vollständige virtuelle Execution erhalten.
+
 class ORBPortfolio:
     def __init__(self, config: dict):
         self.cfg = config
         self.cfg["data_dir"].mkdir(exist_ok=True)
-        self.data = self._load()
+        self.data        = self._load()
         self.daily_stats = self._load_daily_stats()
-        
+
     def _load(self) -> dict:
         if self.cfg["portfolio_file"].exists():
-            with open(self.cfg["portfolio_file"], "r") as f:
+            with open(self.cfg["portfolio_file"]) as f:
                 return json.load(f)
         return {
-            "cash": self.cfg["initial_capital"],
-            "initial_capital": self.cfg["initial_capital"],
-            "positions": {},
-            "trades": [],
-            "equity_curve": [],
-            "daily_pnl": {},
-            "last_updated": None
+            "cash": self.cfg.get("initial_capital", 0.0),
+            "initial_capital": self.cfg.get("initial_capital", 0.0),
+            "positions": {}, "short_positions": {},
+            "trades": [], "equity_curve": [], "daily_pnl": {},
+            "last_updated": None,
         }
-    
+
     def _load_daily_stats(self) -> dict:
         if self.cfg["daily_stats_file"].exists():
-            with open(self.cfg["daily_stats_file"], "r") as f:
+            with open(self.cfg["daily_stats_file"]) as f:
                 return json.load(f)
-        return {
-            "trades_today": 0,
-            "pnl_today": 0.0,
-            "wins_today": 0,
-            "losses_today": 0,
-            "win_rate_today": 0.0,
-            "last_reset_date": None
-        }
-    
+        return {"trades_today": 0, "pnl_today": 0.0, "wins_today": 0,
+                "losses_today": 0, "win_rate_today": 0.0, "last_reset_date": None}
+
     def save(self):
         self.data["last_updated"] = datetime.now().isoformat()
         with open(self.cfg["portfolio_file"], "w") as f:
             json.dump(self.data, f, indent=2)
-    
+
     def _save_daily_stats(self):
         with open(self.cfg["daily_stats_file"], "w") as f:
             json.dump(self.daily_stats, f, indent=2)
-    
+
     def reset_daily_stats_if_needed(self):
         today = datetime.now().date().isoformat()
         if self.daily_stats.get("last_reset_date") != today:
-            self.daily_stats = {
-                "trades_today": 0,
-                "pnl_today": 0.0,
-                "wins_today": 0,
-                "losses_today": 0,
-                "win_rate_today": 0.0,
-                "last_reset_date": today
-            }
+            self.daily_stats = {"trades_today": 0, "pnl_today": 0.0,
+                                "wins_today": 0, "losses_today": 0,
+                                "win_rate_today": 0.0, "last_reset_date": today}
             self._save_daily_stats()
-    
+
     def can_trade_today(self) -> bool:
         self.reset_daily_stats_if_needed()
         return self.daily_stats["trades_today"] < self.cfg["max_daily_trades"]
-    
+
+    def log_order(self, symbol: str, action: str, qty: int,
+                  price: float, stop: float, target: float,
+                  alpaca_order_id: str = "", reason: str = ""):
+        """
+        Speichert eine von Alpaca ausgeführte Order lokal.
+        Kein virtuelles Cash-Update – Alpaca führt die Bücher.
+        """
+        record = {
+            "time":     datetime.now().isoformat(),
+            "symbol":   symbol,
+            "action":   action,
+            "qty":      qty,
+            "price":    price,
+            "stop":     stop,
+            "target":   target,
+            "order_id": alpaca_order_id,
+            "reason":   reason,
+            "strategy": "ORB",
+            "pnl":      0.0,  # wird bei Schließung aktualisiert (optional)
+        }
+        self.data["trades"].append(record)
+        self.daily_stats["trades_today"] += 1
+        self._append_to_memory(
+            f"**{datetime.now().strftime('%Y-%m-%d %H:%M')}** "
+            f"{symbol} {action} {qty} @ {price:.2f} | SL {stop:.2f} | TP {target:.2f} "
+            f"| OrderID {alpaca_order_id} ({reason})"
+        )
+        self._save_daily_stats()
+        self.save()
+
+    # ── Virtuelles Buy/Sell für Backtester ──────────────────────────────────
+
     def has_pos(self, sym: str) -> bool:
         return sym in self.data["positions"]
-    
+
     def get_pos(self, sym: str) -> dict:
         return self.data["positions"].get(sym)
-    
-    def calculate_position_size(self, entry_price: float, stop_loss: float, equity: float, symbol: str = None) -> int:
-        """Universal position size – erkennt automatisch Futures"""
-        if symbol and symbol in self.cfg.get("futures_config", {}).get("point_values", {}):
-            return self._calculate_futures_position_size(symbol, entry_price, stop_loss, equity)
-        # Normaler Stock/ETF Modus
-        risk_per_share = abs(entry_price - stop_loss)
-        if risk_per_share <= 0:
+
+    def calculate_position_size(self, entry: float, stop: float, equity: float) -> int:
+        risk = abs(entry - stop)
+        if risk <= 0:
             return 0
-        risk_amount = equity * self.cfg["risk_per_trade"]
-        shares = int(risk_amount / risk_per_share)
-        max_risk_amount = equity * self.cfg["max_equity_at_risk"]
-        max_shares = int(max_risk_amount / risk_per_share) if risk_per_share > 0 else 0
-        return min(shares, max_shares)
+        shares = int((equity * self.cfg["risk_per_trade"]) / risk)
+        max_sh  = int((equity * self.cfg["max_equity_at_risk"]) / risk)
+        return min(shares, max_sh)
 
-    def _calculate_futures_position_size(self, sym: str, entry_price: float, stop_loss: float, equity: float) -> int:
-        """Spezielle Berechnung für Futures (Kontrakte statt Shares)"""
-        point_value = self.cfg["futures_config"]["point_values"].get(sym, 1)
-        risk_per_point = abs(entry_price - stop_loss)
-        risk_dollar_per_contract = risk_per_point * point_value
-
-        risk_amount = equity * self.cfg["risk_per_trade"]
-        contracts = int(risk_amount / risk_dollar_per_contract) if risk_dollar_per_contract > 0 else 0
-
-        # Margin-Check (max. 30 % des Kapitals für Margin)
-        margin = self.cfg["futures_config"]["margin_per_contract"].get(sym, 10000)
-        max_contracts = int((equity * 0.3) / margin) if margin > 0 else 0
-
-        return min(contracts, max_contracts, 10)  # Sicherheits-Cap
-    
-    def buy(self, sym: str, price: float, shares: int, stop_loss: float, reason: str) -> dict:
-        if shares <= 0:
-            return {"ok": False, "msg": "Invalid shares"}
-        
-        cost = price * shares
-        if cost > self.data["cash"]:
-            return {"ok": False, "msg": "Insufficient cash"}
-        
-        # Check daily trade limit
+    def buy(self, sym: str, price: float, shares: int, stop: float, reason: str) -> dict:
+        if shares <= 0 or price * shares > self.data["cash"]:
+            return {"ok": False}
         if not self.can_trade_today():
-            return {"ok": False, "msg": "Daily trade limit reached"}
-        
-        self.data["cash"] -= cost
-        pos = {
-            "symbol": sym,
-            "shares": shares,
-            "entry": price,
-            "stop_loss": stop_loss,
-            "price": price,
-            "highest": price,
-            "trail_stop": None,
-            "reason": reason,
+            return {"ok": False, "msg": "Daily limit"}
+        self.data["cash"] -= price * shares
+        self.data["positions"][sym] = {
+            "symbol": sym, "shares": shares, "entry": price,
+            "stop_loss": stop, "price": price, "highest": price,
+            "trail_stop": None, "reason": reason,
             "entry_time": datetime.now().isoformat(),
-            "unrealized_pnl": 0.0
         }
-        self.data["positions"][sym] = pos
-        self._log_trade(sym, "BUY", shares, price, 0.0, reason)
-        self._update_daily_stats("entry", 0.0)
+        self._log_bt_trade(sym, "BUY", shares, price, 0.0, reason)
+        self.daily_stats["trades_today"] += 1
+        self._save_daily_stats()
         self.save()
-        return {"ok": True, "pos": pos}
-    
+        return {"ok": True}
+
     def sell(self, sym: str, price: float, shares: int, reason: str) -> dict:
         pos = self.data["positions"].get(sym)
-        if not pos or pos["shares"] < shares:
-            return {"ok": False, "msg": "No position or insufficient shares"}
-        
-        proceeds = price * shares
-        self.data["cash"] += proceeds
-        
-        # Calculate P&L
-        cost_basis = pos["entry"] * shares
-        pnl = proceeds - cost_basis
-        
-        # Update position or remove
-        pos["shares"] -= shares
-        if pos["shares"] <= 0:
-            del self.data["positions"][sym]
-        else:
-            # Update remaining position (simplified)
-            pass
-        
-        self._log_trade(sym, "SELL", shares, price, pnl, reason)
-        if action == "SELL":
-            send_telegram(f"ORB_Bot SELL {sym} {shares} @ {price:.2f} (Pself._log_trade(sym, "SELL", shares, price, pnl, reason)L: {pnl:+.2f}) - {reason}")
-        self._update_daily_stats("exit", pnl)
+        if not pos:
+            return {"ok": False}
+        pnl = (price - pos["entry"]) * shares
+        self.data["cash"] += price * shares
+        del self.data["positions"][sym]
+        self._log_bt_trade(sym, "SELL", shares, price, pnl, reason)
+        self._update_bt_stats(pnl)
         self.save()
-        return {"ok": True, "pnl": pnl, "remaining": pos.get("shares", 0)}
-    
-    def _log_trade(self, sym, action, shares, price, pnl, reason):
-        trade_record = {
-            "time": datetime.now().isoformat(),
-            "symbol": sym,
-            "action": action,
-            "shares": shares,
-            "price": price,
-            "pnl": pnl,
-            "reason": reason,
-            "strategy": "ORB"
-        }
-        self.data["trades"].append(trade_record)
-        
-        # Also append to ORB-specific memory
-        self._append_to_memory(f"**{datetime.now().strftime('%Y-%m-%d %H:%M')}** {sym} {action} {shares} @ {price:.2f} - P&L: {pnl:+.2f} ({reason})")
-    
-    def _update_daily_stats(self, action: str, pnl: float = 0.0):
-        self.daily_stats["pnl_today"] += pnl  # Always update PnL
-        
-        if action == "entry":
-            self.daily_stats["trades_today"] += 1
-        
+        return {"ok": True, "pnl": pnl}
+
+    def _log_bt_trade(self, sym, action, shares, price, pnl, reason):
+        self.data["trades"].append({
+            "time": datetime.now().isoformat(), "symbol": sym,
+            "action": action, "shares": shares, "price": price,
+            "pnl": pnl, "reason": reason, "strategy": "ORB",
+        })
+
+    def _update_bt_stats(self, pnl: float):
+        self.daily_stats["pnl_today"] += pnl
         if pnl > 0:
             self.daily_stats["wins_today"] += 1
         elif pnl < 0:
             self.daily_stats["losses_today"] += 1
-            
-        total_trades = self.daily_stats["wins_today"] + self.daily_stats["losses_today"]
-        self.daily_stats["win_rate_today"] = (self.daily_stats["wins_today"] / max(total_trades, 1)) * 100 if total_trades > 0 else 0.0
-        
+        total = self.daily_stats["wins_today"] + self.daily_stats["losses_today"]
+        self.daily_stats["win_rate_today"] = (
+            self.daily_stats["wins_today"] / max(total, 1) * 100
+        ) if total > 0 else 0.0
         self._save_daily_stats()
-    
-    def _append_to_memory(self, content: str):
-        """Append to ORB-specific memory file"""
-        timestamp = datetime.now().strftime("%Y-%m-%d")
-        memory_path = self.cfg["memory_file"]
-        
-        # Ensure memory file exists with header
-        if not memory_path.exists():
-            with open(memory_path, "w") as f:
-                f.write("# ORB_Bot Memory Log\n\n")
-        
-        with open(memory_path, "a") as f:
-            f.write(f"{content}\n\n")
-    
-    def equity(self, price_dict: dict) -> float:
-        positions_val = sum(p["shares"]*price_dict.get(sym,0) for sym,p in self.data["positions"].items())
-        return self.data["cash"] + positions_val
 
-# ============================= ORB Strategy =============================
+    def _append_to_memory(self, content: str):
+        mp = self.cfg["memory_file"]
+        if not mp.exists():
+            mp.write_text("# ORB_Bot Memory Log\n\n")
+        with open(mp, "a") as f:
+            f.write(f"{content}\n\n")
+
+    def equity(self, price_dict: dict = None) -> float:
+        price_dict = price_dict or {}
+        return self.data["cash"] + sum(
+            p["shares"] * price_dict.get(s, 0)
+            for s, p in self.data["positions"].items()
+        )
+
+
+# ============================= ORB-Strategie ================================
+
 class ORBStrategy:
     def __init__(self, config: dict):
         self.cfg = config
-    
-    def calculate_orb_levels(self, df: pd.DataFrame) -> Tuple[float, float, float, Dict]:
-        """
-        Calculate ORB levels and return additional context
-        Returns: (ORB_high, ORB_low, ORB_range, context_dict)
-        """
+
+    def calculate_orb_levels(self, df: pd.DataFrame) -> Tuple[float, float, float, dict]:
         orb_high, orb_low, orb_range = get_opening_range(df)
-        
-        # Calculate volume confirmation
-        recent_volume = df["Volume"].iloc[-1] if len(df) > 0 else 0
-        avg_volume = df["Volume_MA"].iloc[-1] if len(df) > 0 and not np.isnan(df["Volume_MA"].iloc[-1]) else 1
-        volume_ratio = recent_volume / avg_volume if avg_volume > 0 else 0
-        
-        # For daily data approximation, we estimate bars in ORB period
-        # In a real implementation with intraday data, this would be actual count
-        bars_in_orb_estimate = 6 if len(df) > 0 else 0  # Approximate 6 5-min bars in 30 minutes
-        
-        context = {
-            "volume_ratio": volume_ratio,
-            "volume_confirmed": volume_ratio >= self.cfg["volume_multiplier"],
-            "orb_range_pct": (orb_range / orb_low * 100) if orb_low > 0 else 0,
-            "bars_in_orb": bars_in_orb_estimate
+        vol     = df["Volume"].iloc[-1] if len(df) > 0 else 0
+        vol_ma  = df["Volume_MA"].iloc[-1] if len(df) > 0 and not np.isnan(df["Volume_MA"].iloc[-1]) else 1
+        vol_r   = vol / vol_ma if vol_ma > 0 else 0
+        ctx = {
+            "volume_ratio":     vol_r,
+            "volume_confirmed": vol_r >= self.cfg["volume_multiplier"],
+            "orb_range_pct":    (orb_range / orb_low * 100) if orb_low > 0 else 0,
+            "bars_in_orb":      self._count_orb_bars(df),
         }
-        
-        return orb_high, orb_low, orb_range, context
-    
-    def generate_signal(self, df: pd.DataFrame) -> Tuple[str, float, str, Dict]:
-        """
-        Generate ORB signal
-        Returns: (signal, strength, reason, context)
-        Signal: "BUY", "SELL", or "HOLD"
-        Strength: 0.0 to 1.0
-        """
+        return orb_high, orb_low, orb_range, ctx
+
+    def _count_orb_bars(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        try:
+            idx = df.index
+            if idx.tz is None:
+                idx = pd.DatetimeIndex(idx).tz_localize("UTC").tz_convert("America/New_York")
+            else:
+                idx = idx.tz_convert("America/New_York")
+            hhmm      = idx.hour * 100 + idx.minute
+            last_date = idx.date[-1]
+            return int(((idx.date == last_date) & (hhmm >= 930) & (hhmm < 1000)).sum())
+        except Exception:
+            return 6
+
+    def generate_signal(self, df: pd.DataFrame) -> Tuple[str, float, str, dict]:
         if len(df) < 2:
             return "HOLD", 0.0, "Insufficient data", {}
-        
-        # Need data that includes ORB period and current bar
-        orb_high, orb_low, orb_range, context = self.calculate_orb_levels(df)
-        
-        if orb_range <= 0:
-            return "HOLD", 0.0, "Invalid ORB range", context
-        
-        current_price = df["Close"].iloc[-1]
-        current_time = df.index[-1].to_pydatetime() if hasattr(df.index[-1], 'to_pydatetime') else datetime.now()
-        
-        # Only trade after ORB period ends
-        if not is_orb_period(current_time) and current_time.time() >= self.cfg["orb_end_time"]:
-            # Check for breakout above ORB high
-            if current_price > orb_high:
-                breakout_strength = min((current_price - orb_high) / orb_range, 2.0)  # Cap at 2x range
-                strength = min(breakout_strength, 1.0)  # Normalize to 0-1
-                
-                # Volume confirmation bonus
-                if context["volume_confirmed"]:
-                    strength = min(strength * 1.2, 1.0)
-                
-                reason = f"ORB Breakout: {current_price:.2f} > {orb_high:.2f} (ORB High)"
-                if context["volume_confirmed"]:
-                    reason += f" + Volume Confirmed ({context['volume_ratio']:.1f}x avg)"
-                
-                return "BUY", strength, reason, context
-            
-            # Check for breakdown below ORB low (for short bias or avoidance)
-            elif current_price < orb_low:
-                breakdown_strength = min((orb_low - current_price) / orb_range, 2.0)
-                strength = min(breakdown_strength, 1.0)
-                
-                reason = f"ORB Breakdown: {current_price:.2f} < {orb_low:.2f} (ORB Low)"
-                return "HOLD", strength, reason, context  # We're only doing longs for now
-        
-        return "HOLD", 0.0, "Waiting for ORB breakout", context
 
-# ============================= Main Engine =============================
+        orb_high, orb_low, orb_range, ctx = self.calculate_orb_levels(df)
+        if orb_range <= 0:
+            return "HOLD", 0.0, "Invalid ORB range", ctx
+
+        current_price = df["Close"].iloc[-1]
+        current_time  = (df.index[-1].to_pydatetime()
+                         if hasattr(df.index[-1], "to_pydatetime") else datetime.now())
+
+        if not is_market_hours(current_time):
+            return "HOLD", 0.0, "Outside market hours", ctx
+
+        if not is_orb_period(current_time) and current_time.time() >= self.cfg["orb_end_time"]:
+            if current_price > orb_high:
+                strength = min((current_price - orb_high) / orb_range, 1.0)
+                if ctx["volume_confirmed"]:
+                    strength = min(strength * 1.2, 1.0)
+                reason = f"ORB Breakout: {current_price:.2f} > {orb_high:.2f}"
+                if ctx["volume_confirmed"]:
+                    reason += f" +Vol {ctx['volume_ratio']:.1f}x"
+                return "BUY", strength, reason, ctx
+
+            elif current_price < orb_low:
+                strength = min((orb_low - current_price) / orb_range, 1.0)
+                if ctx["volume_confirmed"]:
+                    strength = min(strength * 1.2, 1.0)
+                reason = f"ORB Breakdown: {current_price:.2f} < {orb_low:.2f}"
+                if ctx["volume_confirmed"]:
+                    reason += f" +Vol {ctx['volume_ratio']:.1f}x"
+                if self.cfg.get("allow_shorts"):
+                    return "SHORT", strength, reason, ctx
+                return "HOLD", strength, f"[SHORT disabled] {reason}", ctx
+
+        return "HOLD", 0.0, "Waiting for ORB breakout", ctx
+
+
+# ============================= ORB_Bot (Live) ================================
+
 class ORB_Bot:
-    def __init__(self, config: Optional[dict] = None):
-        self.cfg = config or ORB_CONFIG
+    """
+    Live-Bot: Datenabruf + Orderausführung via Alpaca.
+    Positionsverwaltung (Stop / Target) übernimmt Alpaca serverseitig
+    über Bracket-Orders → _manage_position() entfällt im Live-Betrieb.
+    """
+
+    def __init__(self, config: dict = None, alpaca: AlpacaClient = None):
+        self.cfg       = config or ORB_CONFIG
+        self.alpaca    = alpaca
         self.portfolio = ORBPortfolio(self.cfg)
-        self.strategy = ORBStrategy(self.cfg)
+        self.strategy  = ORBStrategy(self.cfg)
         self.reports_dir = self.cfg["data_dir"] / "reports"
         self.reports_dir.mkdir(exist_ok=True)
-        
-        print("ORB_Bot initialized")
-        print(f"Trading symbols: {', '.join(self.cfg['symbols'])}")
-        print(f"Data directory: {self.cfg['data_dir']}")
-    
-    def fetch_intraday_data(self, symbol: str, period: str = "5d") -> pd.DataFrame:
-        """Fetch intraday data for ORB calculation"""
-        try:
-            # Get 5-minute data for the last 5 days
-            df = yf.Ticker(symbol).history(period=period, interval="5m")
-            if df.empty:
-                return pd.DataFrame()
-            
-            # For simplicity, we'll work with naive datetime and approximate market hours
-            # Since we're doing daily scans, we'll use daily data for ORB calculation
-            # In a real implementation, you'd need proper timezone handling
-            return df[["Open", "High", "Low", "Close", "Volume"]]
-        except Exception as e:
-            print(f"Error fetching data for {symbol}: {e}")
-            return pd.DataFrame()
-    
+
+        mode = "PAPER" if (alpaca and alpaca.paper) else "LIVE" if alpaca else "KEIN ALPACA"
+        print(f"ORB_Bot  Modus={mode}  Symbole={len(self.cfg['symbols'])}"
+              f"  Shorts={'an' if self.cfg.get('allow_shorts') else 'aus'}")
+
+    # ── Haupt-Scan ───────────────────────────────────────────────────────────
+
     def run_orb_scan(self) -> dict:
-        """Run ORB scan for all symbols"""
-        today = datetime.now().strftime("%Y-%m-%d")
-        print(f"\n=== ORB_Bot Scan – {today} ===")
-        
-        # Update prices and manage existing positions
-        price_dict = {}
-        signals_generated = []
-        
+        now   = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        print(f"\n=== ORB Scan – {today} ===")
+
+        if not is_trading_day(now):
+            print("  Wochenende – kein Scan.")
+            return self._empty_result(today)
+
+        if not is_market_hours(now):
+            et  = pytz.timezone("America/New_York")
+            t   = now.astimezone(et).strftime("%H:%M ET")
+            print(f"  Außerhalb Handelszeiten ({t}) – übersprungen.")
+            return self._empty_result(today)
+
+        if self.cfg.get("avoid_fridays") and now.weekday() == 4:
+            print("  Freitag-Filter aktiv – kein Scan.")
+            return self._empty_result(today)
+        if self.cfg.get("avoid_mondays") and now.weekday() == 0:
+            print("  Montag-Filter aktiv – kein Scan.")
+            return self._empty_result(today)
+
+        # Aktuelle Alpaca-Positionen holen (verhindert Doppel-Entries)
+        open_positions = self.alpaca.sync_positions() if self.alpaca else {}
+        equity         = self.alpaca.get_equity()     if self.alpaca else 0.0
+        signals        = []
+
         for sym in self.cfg["symbols"]:
-            df = self.fetch_intraday_data(sym, period="5d")
-            if df.empty or len(df) < 20:  # Need sufficient data
-                print(f"  {sym}: Insufficient data")
+            df = (self.alpaca.fetch_bars(sym, days=5) if self.alpaca
+                  else pd.DataFrame())
+            if df.empty or len(df) < 20:
+                print(f"  {sym}: keine Daten")
                 continue
-            
             df = compute_indicators(df)
-            current_price = df["Close"].iloc[-1]
-            price_dict[sym] = current_price
-            
-            # Manage existing positions
-            if self.portfolio.has_pos(sym):
-                pos = self.portfolio.get_pos(sym)
-                self._manage_position(sym, pos, current_price, df)
-            
-            # Generate new signals if we can trade
-            elif self.portfolio.can_trade_today():
-                # Apply weekday filters first
-                current_weekday = datetime.now().weekday()  # Monday=0, Sunday=6
-                if self.cfg.get("avoid_fridays", False) and current_weekday == 4:  # Friday
-                    print(f"  {sym}: SKIPPED (Friday filter)")
-                    continue
-                if self.cfg.get("avoid_mondays", False) and current_weekday == 0:  # Monday
-                    print(f"  {sym}: SKIPPED (Monday filter)")
-                    continue
-                
-                signal, strength, reason, context = self.strategy.generate_signal(df)
-                if signal == "BUY" and strength > 0.3:  # Minimum strength threshold
-                    # Calculate stop loss based on ORB range or ATR
-                    orb_high, orb_low, orb_range, _ = self.strategy.calculate_orb_levels(df)
-                    atr_value = df["ATR"].iloc[-1] if not np.isnan(df["ATR"].iloc[-1]) else orb_range
-                    
-                    # Use ORB low as stop loss, or ATR-based stop, whichever is tighter
-                    stop_loss_or_low = orb_low
-                    stop_loss_atr = current_price - (1.5 * atr_value)  # 1.5 ATR stop
-                    stop_loss = max(stop_loss_or_low, stop_loss_atr)  # The higher (closer to entry) stop
-                    
-                    # Ensure stop loss is below entry
-                    if stop_loss >= current_price:
-                        stop_loss = current_price - (1.0 * atr_value)  # Fallback to 1 ATR
-                    
-                    shares = self.portfolio.calculate_position_size(current_price, stop_loss, self.portfolio.equity(price_dict), symbol=sym)
-                    
-                    if shares > 0:
-                        res = self.portfolio.buy(sym, current_price, shares, stop_loss, reason)
-                        if res["ok"]:
-                            print(f"  {sym}: BUY {shares} @ {current_price:.2f} (SL: {stop_loss:.2f}) - {reason}")
-                            signals_generated.append({
-                                "symbol": sym,
-                                "action": "BUY",
-                                "shares": shares,
-                                "price": current_price,
-                                "stop_loss": stop_loss,
-                                "reason": reason,
-                                "strength": strength
-                            })
-                            send_telegram(f"ORB_Bot BUY {sym} {shares} @ {current_price:.2f} (SL: {stop_loss:.2f}) - {reason}")
-                        else:
-                            print(f"  {sym}: FAILED BUY - {res.get('msg', 'Unknown error')}")
-                    else:
-                        print(f"  {sym}: ZERO POSITION SIZE CALCULATED")
-                else:
-                    if signal == "BUY":
-                        print(f"  {sym}: HOLD (weak signal: strength={strength:.2f}) - {reason}")
-                    else:
-                        print(f"  {sym}: {signal} - {reason}")
+
+            # Bereits offen? → Status ausgeben, nichts tun (Alpaca managt Exit)
+            if sym in open_positions:
+                pos = open_positions[sym]
+                print(f"  {sym}: offen {pos['side'].upper()} {pos['qty']} "
+                      f"@ {pos['entry']:.2f}  uPnL {pos['unrealized_pnl']:+.2f}")
+                continue
+
+            if not self.portfolio.can_trade_today():
+                print(f"  {sym}: Tageslimit erreicht")
+                continue
+
+            signal, strength, reason, ctx = self.strategy.generate_signal(df)
+
+            if signal == "BUY" and strength > 0.3:
+                sig = self._execute_long(sym, df, equity, reason, strength)
+                if sig:
+                    signals.append(sig)
+
+            elif signal == "SHORT" and strength > 0.3:
+                sig = self._execute_short(sym, df, equity, reason, strength)
+                if sig:
+                    signals.append(sig)
+
             else:
-                print(f"  {sym}: DAILY TRADE LIMIT REACHED")
-        
-        # Generate daily report
-        equity = self.portfolio.equity(price_dict)
-        self._generate_daily_report(today, price_dict, equity, signals_generated)
-        
+                label = f"HOLD (Stärke {strength:.2f})" if signal in ("BUY","SHORT") else signal
+                print(f"  {sym}: {label} – {reason}")
+
+        # ── EOD-Close (< 15 Min bis Marktschluss) ───────────────────────────
+        et_now    = now.astimezone(pytz.timezone("America/New_York"))
+        mins_left = (16 * 60) - (et_now.hour * 60 + et_now.minute)
+        if 0 < mins_left <= 15:
+            print(f"  {mins_left} Min bis Schluss – EOD Close")
+            if self.alpaca:
+                self.alpaca.close_all_positions()
+            send_telegram("ORB_Bot EOD: alle Positionen geschlossen")
+
+        self._write_report(today, signals, equity)
         return {
-            "date": today,
-            "equity": equity,
-            "signals_generated": len(signals_generated),
-            "positions": list(self.portfolio.data["positions"].keys()),
-            "daily_trades": self.portfolio.daily_stats["trades_today"]
-        }
-    
-    def _manage_position(self, sym: str, pos: dict, current_price: float, df: pd.DataFrame):
-        """Manage existing position with profit targets and trailing stops"""
-        entry_price = pos["entry"]
-        shares = pos["shares"]
-        initial_stop = pos["stop_loss"]
-        
-        # Calculate risk and reward in R multiples
-        risk_per_share = entry_price - initial_stop
-        if risk_per_share <= 0:
-            # Invalid risk, exit immediately
-            res = self.portfolio.sell(sym, current_price, shares, "Invalid risk parameters")
-            if res["ok"]:
-                print(f"  {sym}: EXIT (Invalid Risk) {shares} @ {current_price:.2f} (P&L: {res['pnl']:.2f})")
-            return
-        
-        profit_per_share = current_price - entry_price
-        r_multiple = profit_per_share / risk_per_share if risk_per_share > 0 else 0
-        
-        # Check for profit target
-        if r_multiple >= self.cfg["profit_target_r"]:
-            res = self.portfolio.sell(sym, current_price, shares, f"Profit Target ({r_multiple:.1f}R)")
-            if res["ok"]:
-                print(f"  {sym}: TARGET EXIT {shares} @ {current_price:.2f} (P&L: {res['pnl']:.2f}, {r_multiple:.1f}R)")
-            return
-        
-        # Check for stop loss
-        if current_price <= initial_stop:
-            res = self.portfolio.sell(sym, current_price, shares, "Stop Loss")
-            if res["ok"]:
-                print(f"  {sym}: STOP EXIT {shares} @ {current_price:.2f} (P&L: {res['pnl']:.2f})")
-            return
-        
-        # Check for trailing stop activation
-        if r_multiple >= self.cfg["trail_after_r"] and pos.get("trail_stop") is None:
-            # Activate trailing stop
-            atr_value = df["ATR"].iloc[-1] if not np.isnan(df["ATR"].iloc[-1]) else (entry_price - initial_stop)
-            trail_amount = self.cfg["trail_distance_r"] * risk_per_share
-            pos["trail_stop"] = current_price - trail_amount
-            pos["highest"] = max(pos.get("highest", entry_price), current_price)
-            print(f"  {sym}: TRAIL ACTIVATED @ {current_price:.2f} (Trail: {pos['trail_stop']:.2f})")
-            self.portfolio.save()  # Persist position changes
-        
-        # Update trailing stop if active
-        if pos.get("trail_stop") is not None:
-            # Update highest price
-            if current_price > pos.get("highest", entry_price):
-                pos["highest"] = current_price
-                # Trail stop up: move stop up as price makes new highs
-                trail_amount = self.cfg["trail_distance_r"] * risk_per_share
-                new_trail_stop = pos["highest"] - trail_amount
-                if new_trail_stop > pos["trail_stop"]:
-                    pos["trail_stop"] = new_trail_stop
-                    print(f"  {sym}: TRAIL UPDATE @ {current_price:.2f} (New Trail: {pos['trail_stop']:.2f})")
-                    self.portfolio.save()  # Persist position changes
-            
-            # Check if trailing stop is hit
-            if current_price <= pos["trail_stop"]:
-                res = self.portfolio.sell(sym, current_price, shares, "Trailing Stop")
-                if res["ok"]:
-                    print(f"  {sym}: TRAIL EXIT {shares} @ {current_price:.2f} (P&L: {res['pnl']:.2f})")
-                return
-        
-        # Update current price in position
-        pos["price"] = current_price
-        self.portfolio.save()  # Persist position changes
-    
-    def _generate_daily_report(self, date_str: str, price_dict: dict, equity: float, signals: list):
-        """Generate daily ORB bot report"""
-        report_file = self.reports_dir / f"orb_report_{date_str}.txt"
-        init_capital = self.cfg["initial_capital"]
-        total_return = (equity / init_capital - 1) * 100
-        
-        lines = []
-        lines.append("="*60)
-        lines.append(f"ORB_BOT – DAILY REPORT – {date_str}")
-        lines.append("="*60)
-        lines.append("")
-        lines.append(f"Starting Capital: {init_capital:,.2f} {self.cfg['currency']}")
-        lines.append(f"Current Equity:   {equity:,.2f} {self.cfg['currency']}")
-        lines.append(f"Daily Return:     {total_return:+.2f}%")
-        lines.append("")
-        lines.append(f"Signals Generated: {len(signals)}")
-        lines.append(f"Trades Today:      {self.portfolio.daily_stats['trades_today']}/{self.cfg['max_daily_trades']}")
-        lines.append(f"Daily P&L:         {self.portfolio.daily_stats['pnl_today']:+.2f} {self.cfg['currency']}")
-        lines.append("")
-        lines.append("Open Positions:")
-        if self.portfolio.data["positions"]:
-            for sym, pos in self.portfolio.data["positions"].items():
-                unrealized_pnl = (price_dict.get(sym, 0) - pos["entry"]) * pos["shares"]
-                lines.append(
-                    f"  {sym}: {pos['shares']} sh @ {pos['entry']:.2f} → "
-                    f"now {price_dict.get(sym,0):.2f} | "
-                    f"SL {pos.get('stop_loss',0):.2f} | "
-                    f"{'Trail: '+str(round(pos.get('trail_stop',0),2)) if pos.get('trail_stop') else 'No Trail'} | "
-                    f"P&L: {unrealized_pnl:+.2f}"
-                )
-        else:
-            lines.append("  (none)")
-        lines.append("")
-        lines.append("Today's Signals:")
-        if signals:
-            for sig in signals:
-                lines.append(
-                    f"  {sig['symbol']}: {sig['action']} {sig['shares']} @ {sig['price']:.2f} "
-                    f"(SL: {sig['stop_loss']:.2f}) - {sig['reason']} [Strength: {sig['strength']:.2f}]"
-                )
-        else:
-            lines.append("  (none)")
-        lines.append("")
-        lines.append("="*60)
-        
-        with open(report_file, "w") as f:
-            f.write("\n".join(lines))
-        
-        print(f"  Report written to {report_file}")
-    
-    def get_status(self) -> dict:
-        """Get current bot status"""
-        # Get latest prices for equity calculation
-        price_dict = {}
-        for sym in self.cfg["symbols"][:3]:  # Just check first 3 for status
-            df = self.fetch_intraday_data(sym, period="1d")
-            if not df.empty:
-                price_dict[sym] = df["Close"].iloc[-1]
-        
-        equity = self.portfolio.equity(price_dict) if price_dict else self.portfolio.data["cash"]
-        init_capital = self.cfg["initial_capital"]
-        total_return = (equity / init_capital - 1) * 100 if init_capital > 0 else 0
-        
-        return {
-            "bot_name": "ORB_Bot",
-            "status": "active",
-            "equity": equity,
-            "return_pct": total_return,
-            "open_positions": list(self.portfolio.data["positions"].keys()),
-            "daily_trades": self.portfolio.daily_stats["trades_today"],
-            "max_daily_trades": self.cfg["max_daily_trades"],
-            "data_directory": str(self.cfg["data_dir"]),
-            "memory_file": str(self.cfg["memory_file"])
+            "date":       today,
+            "equity":     equity,
+            "signals":    len(signals),
+            "open":       list(open_positions.keys()),
+            "trades_today": self.portfolio.daily_stats["trades_today"],
         }
 
-# ============================= BACKTESTER =============================
-import pandas as pd
-from datetime import datetime, timedelta
-import time
+    # ── Signal-Ausführung ────────────────────────────────────────────────────
+
+    def _execute_long(self, sym: str, df: pd.DataFrame,
+                      equity: float, reason: str, strength: float) -> Optional[dict]:
+        orb_high, orb_low, orb_range, _ = self.strategy.calculate_orb_levels(df)
+        current  = df["Close"].iloc[-1]
+        atr      = df["ATR"].iloc[-1] if not np.isnan(df["ATR"].iloc[-1]) else orb_range
+        stop     = max(orb_low, current - 1.5 * atr)
+        if stop >= current:
+            stop = current - atr
+        target   = current + self.cfg["profit_target_r"] * (current - stop)
+        qty      = self.portfolio.calculate_position_size(current, stop, equity)
+        if qty <= 0:
+            print(f"  {sym}: Positionsgröße = 0 – übersprungen")
+            return None
+
+        order = self.alpaca.place_long_bracket(sym, qty, stop, target) if self.alpaca else None
+        if self.alpaca and order is None:
+            return None
+
+        self.portfolio.log_order(sym, "BUY", qty, current, stop, target,
+                                  alpaca_order_id=order["id"] if order else "SIM",
+                                  reason=reason)
+        send_telegram(f"ORB BUY {sym} {qty} @ {current:.2f} | SL {stop:.2f} | TP {target:.2f}")
+        return {"symbol": sym, "action": "BUY", "qty": qty,
+                "price": current, "stop": stop, "target": target,
+                "strength": strength, "reason": reason}
+
+    def _execute_short(self, sym: str, df: pd.DataFrame,
+                        equity: float, reason: str, strength: float) -> Optional[dict]:
+        orb_high, orb_low, orb_range, _ = self.strategy.calculate_orb_levels(df)
+        current  = df["Close"].iloc[-1]
+        atr      = df["ATR"].iloc[-1] if not np.isnan(df["ATR"].iloc[-1]) else orb_range
+        stop     = min(orb_high, current + 1.5 * atr)
+        if stop <= current:
+            stop = current + atr
+        target   = current - self.cfg["profit_target_r"] * (stop - current)
+        qty      = self.portfolio.calculate_position_size(current, stop, equity)
+        if qty <= 0:
+            print(f"  {sym}: Positionsgröße = 0 – übersprungen")
+            return None
+
+        order = self.alpaca.place_short_bracket(sym, qty, stop, target) if self.alpaca else None
+        if self.alpaca and order is None:
+            return None
+
+        self.portfolio.log_order(sym, "SHORT", qty, current, stop, target,
+                                  alpaca_order_id=order["id"] if order else "SIM",
+                                  reason=reason)
+        send_telegram(f"ORB SHORT {sym} {qty} @ {current:.2f} | SL {stop:.2f} | TP {target:.2f}")
+        return {"symbol": sym, "action": "SHORT", "qty": qty,
+                "price": current, "stop": stop, "target": target,
+                "strength": strength, "reason": reason}
+
+    # ── Status & Report ──────────────────────────────────────────────────────
+
+    def get_status(self) -> dict:
+        positions = self.alpaca.sync_positions() if self.alpaca else {}
+        equity    = self.alpaca.get_equity()     if self.alpaca else 0.0
+        orders    = self.alpaca.get_open_orders()if self.alpaca else []
+        return {
+            "mode":         "PAPER" if (self.alpaca and self.alpaca.paper) else "LIVE",
+            "equity":       equity,
+            "cash":         self.alpaca.get_cash()         if self.alpaca else 0.0,
+            "buying_power": self.alpaca.get_buying_power() if self.alpaca else 0.0,
+            "open_positions": positions,
+            "open_orders":    orders,
+            "trades_today":   self.portfolio.daily_stats["trades_today"],
+            "pnl_today":      self.portfolio.daily_stats["pnl_today"],
+        }
+
+    def _write_report(self, date_str: str, signals: list, equity: float):
+        path  = self.reports_dir / f"orb_report_{date_str}.txt"
+        lines = [
+            "=" * 60,
+            f"ORB_BOT – DAILY REPORT – {date_str}",
+            f"Modus: {'PAPER' if (self.alpaca and self.alpaca.paper) else 'LIVE'}",
+            "=" * 60,
+            f"Eigenkapital:  {equity:,.2f} {self.cfg['currency']}",
+            f"Trades heute:  {self.portfolio.daily_stats['trades_today']}/"
+            f"{self.cfg['max_daily_trades']}",
+            "",
+            "Signale:",
+        ]
+        for s in signals:
+            lines.append(
+                f"  {s['symbol']}: {s['action']} {s['qty']} @ {s['price']:.2f} "
+                f"| SL {s['stop']:.2f} | TP {s['target']:.2f} "
+                f"[{s['strength']:.2f}] – {s['reason']}"
+            )
+        if not signals:
+            lines.append("  (keine)")
+        lines.append("=" * 60)
+        path.write_text("\n".join(lines))
+        print(f"  Report: {path}")
+
+    @staticmethod
+    def _empty_result(today: str) -> dict:
+        return {"date": today, "equity": 0.0, "signals": 0,
+                "open": [], "trades_today": 0}
+
+
+# ============================= Backtester ===================================
+# Nutzt Alpaca für historische Daten, virtuelle Execution (kein echtes Geld).
 
 class ORB_Backtester:
-    def __init__(self, config: dict = None):
-        self.cfg = config or ORB_CONFIG
+    def __init__(self, config: dict = None, alpaca: AlpacaClient = None):
+        self.cfg       = config or ORB_CONFIG
+        self.alpaca    = alpaca
         self.portfolio = ORBPortfolio(self.cfg)
-        self.strategy = ORBStrategy(self.cfg)
-        self.commission_rate = 0.00005 # 0.005 %
-        self.slippage_rate = 0.0002 # 0.02 %
-
-    def _download_chunked_5m(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """Lädt 5m-Daten monatsweise (yfinance-Limit umgehen)"""
-        start = datetime.strptime(start_date, "%Y-%m-%d")
-        end = datetime.strptime(end_date, "%Y-%m-%d")
-        all_dfs = []
- 
-        current = start
-        print(f"Downloading {symbol}...")
-        while current < end:
-            chunk_end = min(current + timedelta(days=59), end) # max ~60 Tage pro Call
-            try:
-                df = yf.Ticker(symbol).history(
-                    start=current.strftime("%Y-%m-%d"),
-                    end=chunk_end.strftime("%Y-%m-%d"),
-                    interval="5m"
-                )
-                if not df.empty:
-                    all_dfs.append(df)
-                    print(f"Downloaded up to {chunk_end.date()}", end=" ")
-            except Exception as e:
-                print(f"Error {symbol} {current.date()}: {e}")
-            
-            current = chunk_end + timedelta(days=1)
-            time.sleep(0.5) # höflich zu Yahoo
-        
-        if not all_dfs:
-            return pd.DataFrame()
-        
-        df = pd.concat(all_dfs)
-        df = df[["Open", "High", "Low", "Close", "Volume"]]
-        df = df[~df.index.duplicated(keep='first')]
-        return df
+        self.strategy  = ORBStrategy(self.cfg)
+        self.commission = 0.00005
+        self.slippage   = 0.0002
 
     def run_backtest(self, start_date: str = "2024-01-01", end_date: str = None):
-        """Haupt-Backtest"""
         if end_date is None:
             end_date = datetime.now().strftime("%Y-%m-%d")
-        
-        print(f"\n=== ORB_Backtester – {start_date} bis {end_date} ===\n")
-        
-        # Daten für alle Symbole laden
-        data_cache = {}
-        for sym in self.cfg["symbols"]:
-            print(f"Lade Daten für {sym}...")
-            df = self._download_chunked_5m(sym, start_date, end_date)
-            if len(df) > 100:
-                data_cache[sym] = compute_indicators(df)
-                print(f" ✓ {len(df)} 5m-Bars geladen")
-            else:
-                print(f" ✗ Zu wenig Daten für {sym}")
-        
-        # Portfolio zurücksetzen
-        self.portfolio.data = self.portfolio._load()
-        self.portfolio.data["cash"] = self.cfg["initial_capital"]
-        self.portfolio.data["positions"] = {}
-        self.portfolio.data["trades"] = []
-        
-        # Bar-by-Bar Simulation (nur nach 10:00 ET)
-        all_dates = pd.date_range(start_date, end_date, freq='B')
-        
-        for current_date in all_dates:
-            date_str = current_date.strftime("%Y-%m-%d")
-            weekday = current_date.weekday()
-            
-            # Weekday-Filter (wie im Live-Bot)
-            if self.cfg.get("avoid_fridays") and weekday == 4:
+        print(f"\n=== ORB Backtest {start_date} → {end_date} ===")
+
+        # ── Daten laden ──────────────────────────────────────────────────────
+        # Nur Stocks (keine Futures – Alpaca liefert keine)
+        tradeable = self.cfg["symbols"]
+        if self.alpaca:
+            print("Lade Daten via Alpaca...")
+            raw = self.alpaca.fetch_bars_bulk(tradeable, start_date, end_date)
+        else:
+            print("[WARN] Kein Alpaca-Client – kein Datenabruf möglich")
+            return []
+
+        data_cache = {s: compute_indicators(df)
+                      for s, df in raw.items() if len(df) > 100}
+        if not data_cache:
+            print("Keine Daten – Abbruch")
+            return []
+
+        # ── Portfolio zurücksetzen ───────────────────────────────────────────
+        self.portfolio.data.update({
+            "cash": self.cfg.get("initial_capital", 10000.0),
+            "positions": {}, "short_positions": {},
+            "trades": [], "equity_curve": [],
+        })
+
+        # ── Bar-by-Bar-Simulation ────────────────────────────────────────────
+        for current_date in pd.date_range(start_date, end_date, freq="B"):
+            if self.cfg.get("avoid_fridays") and current_date.weekday() == 4:
                 continue
-            if self.cfg.get("avoid_mondays") and weekday == 0:
+            if self.cfg.get("avoid_mondays") and current_date.weekday() == 0:
                 continue
-            
-            price_dict = {}
-            signals_generated = []
-            
+
+            price_dict: Dict[str, float] = {}
+
             for sym, df_full in data_cache.items():
-                # Nur Bars bis heute
-                day_df = df_full[df_full.index.date == current_date.date()]
-                if day_df.empty or len(day_df) < 20:
+                day_df = df_full[df_full.index.date == current_date.date()].sort_index()
+                if day_df.empty or len(day_df) < 8:
                     continue
-                
-                df = day_df.copy()
-                current_price = df["Close"].iloc[-1]
-                price_dict[sym] = current_price
-                
-                # Position managen
-                if self.portfolio.has_pos(sym):
-                    pos = self.portfolio.get_pos(sym)
-                    self._manage_position(sym, pos, current_price, df)
-                
-                # Neues Signal nur nach ORB-Ende
-                elif self.portfolio.can_trade_today():
-                    orb_high, orb_low, orb_range, _ = self.strategy.calculate_orb_levels(df)
+
+                idx_et = (day_df.index.tz_localize("UTC") if day_df.index.tz is None
+                          else day_df.index).tz_convert("America/New_York")
+                hhmm   = idx_et.hour * 100 + idx_et.minute
+
+                if (hhmm >= 930) & (hhmm < 1000):
+                    if ((hhmm >= 930) & (hhmm < 1000)).sum() < 2:
+                        continue
+
+                post_orb = day_df[hhmm >= 1000]
+                if post_orb.empty:
+                    continue
+
+                entered = False
+
+                for bar_idx, bar in post_orb.iterrows():
+                    current_price       = bar["Close"]
+                    price_dict[sym]     = current_price
+
+                    if self.portfolio.has_pos(sym):
+                        closed = self._manage_bar(sym, self.portfolio.get_pos(sym), bar)
+                        if closed:
+                            break
+                        continue
+
+                    if entered or not self.portfolio.can_trade_today():
+                        continue
+
+                    bars_so_far = day_df.loc[:bar_idx]
+                    orb_high, orb_low, orb_range, _ = self.strategy.calculate_orb_levels(bars_so_far)
                     if orb_range <= 0:
                         continue
-                    
-                    signal, strength, reason, context = self.strategy.generate_signal(df)
-                    
+
+                    signal, strength, reason, _ = self.strategy.generate_signal(bars_so_far)
                     if signal == "BUY" and strength > 0.3:
-                        atr_value = df["ATR"].iloc[-1] if not np.isnan(df["ATR"].iloc[-1]) else orb_range
-                        stop_loss_or_low = orb_low
-                        stop_loss_atr = current_price - (1.5 * atr_value)
-                        stop_loss = max(stop_loss_or_low, stop_loss_atr)
-                        if stop_loss >= current_price:
-                            stop_loss = current_price - atr_value
-                        
-                        shares = self.portfolio.calculate_position_size(
-                            current_price, stop_loss, self.portfolio.equity(price_dict), symbol=sym
-                        )
-                        
-                        if shares > 0:
-                            # Kosten simulieren
-                            cost = current_price * shares * (1 + self.commission_rate + self.slippage_rate)
+                        entry = current_price * (1 + self.slippage)
+                        atr   = bars_so_far["ATR"].iloc[-1]
+                        if np.isnan(atr):
+                            atr = orb_range
+                        stop  = max(orb_low, entry - 1.5 * atr)
+                        if stop >= entry:
+                            stop = entry - atr
+                        qty   = self.portfolio.calculate_position_size(
+                                    entry, stop, self.portfolio.equity(price_dict))
+                        if qty > 0:
+                            cost = entry * qty * (1 + self.commission)
                             if cost <= self.portfolio.data["cash"]:
-                                res = self.portfolio.buy(sym, current_price, shares, stop_loss, reason)
-                                if res["ok"]:
-                                    signals_generated.append({
-                                        "symbol": sym, "action": "BUY", "shares": shares,
-                                        "price": current_price, "stop_loss": stop_loss, "reason": reason
-                                    })
-            
-            # Equity für diesen Tag speichern
-            equity = self.portfolio.equity(price_dict)
+                                self.portfolio.buy(sym, entry, qty, stop, reason)
+                                entered = True
+                        break
+
             self.portfolio.data["equity_curve"].append({
-                "date": date_str,
-                "equity": equity
+                "date": current_date.strftime("%Y-%m-%d"),
+                "equity": self.portfolio.equity(price_dict),
             })
-        
-        # Ergebnisse auswerten
-        self._print_backtest_results()
-        self._save_backtest_report(start_date, end_date)
-        
+
+        self._print_results()
         return self.portfolio.data["trades"]
 
-    def _manage_position(self, sym: str, pos: dict, current_price: float, df: pd.DataFrame):
-        """Position management for backtest (uses live bot logic)"""
-        # Use the live bot's management logic
-        bot = ORB_Bot(self.cfg)
-        bot.portfolio.data = self.portfolio.data  # Use backtest portfolio
-        bot.portfolio._save_daily_stats = lambda: None  # Disable stats save for backtest
-        bot._manage_position(sym, pos, current_price, df)
+    def _manage_bar(self, sym: str, pos: dict, bar: pd.Series) -> bool:
+        """Bar-by-Bar Exit-Logik für Backtester."""
+        entry = pos["entry"]
+        stop  = pos["stop_loss"]
+        risk  = entry - stop
+        if risk <= 0:
+            self.portfolio.sell(sym, bar["Close"], pos["shares"], "Invalid risk")
+            return True
 
-    def _print_backtest_results(self):
-        """Pretty results output"""
+        target = entry + self.cfg["profit_target_r"] * risk
+
+        if bar["Low"] <= stop:
+            ep = stop * (1 - self.slippage)
+            self.portfolio.sell(sym, ep, pos["shares"], "Stop Loss")
+            return True
+        if bar["High"] >= target:
+            ep = target * (1 - self.slippage)
+            self.portfolio.sell(sym, ep, pos["shares"], "Profit Target")
+            return True
+
+        # Trailing Stop
+        r_mult = (bar["Close"] - entry) / risk
+        if r_mult >= self.cfg["trail_after_r"]:
+            trail = bar["Close"] - self.cfg["trail_distance_r"] * risk
+            if trail > (pos.get("trail_stop") or stop):
+                pos["trail_stop"] = trail
+        if pos.get("trail_stop") and bar["Low"] <= pos["trail_stop"]:
+            ep = pos["trail_stop"] * (1 - self.slippage)
+            self.portfolio.sell(sym, ep, pos["shares"], "Trailing Stop")
+            return True
+
+        pos["price"] = bar["Close"]
+        return False
+
+    def _print_results(self):
         trades = self.portfolio.data["trades"]
         if not trades:
-            print("Keine Trades ausgeführt.")
+            print("Keine Trades.")
             return
-        
-        df_trades = pd.DataFrame(trades)
-        wins = df_trades[df_trades["pnl"] > 0]
-        
-        total_return = (self.portfolio.equity({}) / self.cfg["initial_capital"] - 1) * 100
-        win_rate = len(wins) / len(df_trades) * 100 if len(df_trades) > 0 else 0
-        gross_profit = wins["pnl"].sum()
-        gross_loss = df_trades[df_trades["pnl"] < 0]["pnl"].sum()
-        profit_factor = abs(gross_profit / gross_loss) if gross_loss != 0 else float('inf')
-        
-        equity_curve = pd.DataFrame(self.portfolio.data["equity_curve"])
-        equity_curve["date"] = pd.to_datetime(equity_curve["date"])
-        equity_curve.set_index("date", inplace=True)
-        max_dd = ((equity_curve["equity"] / equity_curve["equity"].cummax()) - 1).min() * 100
-        
-        print("\n" + "="*70)
-        print("ORB_BACKTEST RESULTS")
-        print("="*70)
-        print(f"Zeitraum : {self.portfolio.data['equity_curve'][0]['date']} – {self.portfolio.data['equity_curve'][-1]['date']}")
-        print(f"Startkapital : {self.cfg['initial_capital']:,.0f} EUR")
-        print(f"Endkapital : {self.portfolio.equity({}):,.0f} EUR")
-        print(f"Gesamtrendite : {total_return:+.2f} %")
-        print(f"Trades : {len(df_trades)}")
-        print(f"Win-Rate : {win_rate:.1f} %")
-        print(f"Profit-Faktor : {profit_factor:.2f}")
-        print(f"Max. Drawdown : {max_dd:.2f} %")
-        print(f"Durchschnittlicher Trade: {df_trades['pnl'].mean():+.2f} EUR")
-        print("="*70)
+        df   = pd.DataFrame(trades)
+        wins = df[df["pnl"] > 0]
+        init = self.cfg.get("initial_capital", 10000.0)
+        eq   = self.portfolio.equity()
+        ret  = (eq / init - 1) * 100
+        wr   = len(wins) / len(df) * 100
+        gp   = wins["pnl"].sum()
+        gl   = df[df["pnl"] < 0]["pnl"].sum()
+        pf   = abs(gp / gl) if gl != 0 else float("inf")
+        ec   = pd.DataFrame(self.portfolio.data["equity_curve"])
+        ec["date"] = pd.to_datetime(ec["date"])
+        ec.set_index("date", inplace=True)
+        mdd  = ((ec["equity"] / ec["equity"].cummax()) - 1).min() * 100
+        print("\n" + "="*60)
+        print("BACKTEST ERGEBNIS")
+        print("="*60)
+        print(f"Startkapital  : {init:,.0f}")
+        print(f"Endkapital    : {eq:,.0f}")
+        print(f"Rendite       : {ret:+.2f} %")
+        print(f"Trades        : {len(df)}")
+        print(f"Win-Rate      : {wr:.1f} %")
+        print(f"Profit-Faktor : {pf:.2f}")
+        print(f"Max. Drawdown : {mdd:.2f} %")
+        print(f"Ø Trade       : {df['pnl'].mean():+.2f}")
+        print("="*60)
 
-    def _save_backtest_report(self, start_date: str, end_date: str):
-        report_file = self.cfg["data_dir"] / f"backtest_{start_date}_{end_date}.txt"
-        with open(report_file, "w") as f:
-            f.write("ORB_Backtester – Full Report\n")
-            f.write("="*60 + "\n")
-            f.write(f"Zeitraum: {start_date} – {end_date}\n")
-            f.write(f"Symbole: {', '.join(self.cfg['symbols'])}\n\n")
-            f.write("Trades:\n")
-            for t in self.portfolio.data["trades"]:
-                f.write(f"{t['time']} {t['symbol']} {t['action']} {t['shares']} @ {t['price']:.2f} | P&L: {t['pnl']:+.2f}\n")
-        print(f"\n✅ Vollständiger Bericht gespeichert: {report_file}")
 
-# ============================= Neue Entrypoints =============================
-def run_backtest_mode():
-    bot = ORB_Bot() # nur zum Initialisieren der Config
-    tester = ORB_Backtester(bot.cfg)
-    tester.run_backtest(start_date="2024-01-01", end_date="2025-04-01") # ← hier anpassen!
+# ============================= CLI / OpenClaw-Einstieg ======================
 
-# ============================= Entrypoint =============================
+def _build_alpaca_client(cfg: dict) -> Optional["AlpacaClient"]:
+    """
+    Liest Alpaca-Keys aus Umgebungsvariablen.
+    OpenClaw setzt APCA_API_KEY_ID und APCA_API_SECRET_KEY automatisch,
+    wenn der Nutzer den Alpaca-Skill installiert hat.
+    """
+    if not ALPACA_AVAILABLE:
+        print("[ERROR] alpaca-py fehlt – pip install alpaca-py", file=sys.stderr)
+        return None
+
+    key    = os.getenv("APCA_API_KEY_ID")
+    secret = os.getenv("APCA_API_SECRET_KEY")
+
+    if not key or not secret:
+        print("[ERROR] APCA_API_KEY_ID / APCA_API_SECRET_KEY nicht gesetzt.\n"
+              "  In OpenClaw: clawhub install alpaca-trading → Keys hinterlegen\n"
+              "  Lokal:       export APCA_API_KEY_ID=pk_...\n"
+              "               export APCA_API_SECRET_KEY=sk_...",
+              file=sys.stderr)
+        return None
+
+    # APCA_PAPER=false → Live; alles andere → Paper
+    paper_env = os.getenv("APCA_PAPER", "true").lower()
+    paper     = paper_env != "false"
+
+    # cfg-Wert als Fallback, aber Env-Var hat Vorrang
+    paper     = paper and cfg.get("alpaca_paper", True)
+
+    feed = os.getenv("APCA_DATA_FEED", cfg.get("alpaca_data_feed", "iex"))
+
+    return AlpacaClient(api_key=key, secret_key=secret, paper=paper, data_feed=feed)
+
+
 def main():
-    bot = ORB_Bot()
-    bot.run_orb_scan()
+    parser = argparse.ArgumentParser(
+        description="ORB_Bot – Opening Range Breakout (Alpaca Edition)",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--mode", choices=["scan", "status", "eod", "backtest"],
+        default="scan",
+        help=(
+            "scan      – Signalsuche + Orderausführung  (Standard)\n"
+            "status    – Portfolio-Status ausgeben (JSON)\n"
+            "eod       – Alle Positionen sofort schließen\n"
+            "backtest  – Historischen Backtest starten"
+        ),
+    )
+    parser.add_argument("--start", default="2024-01-01",
+                        help="Backtest-Start (YYYY-MM-DD)")
+    parser.add_argument("--end",   default=None,
+                        help="Backtest-Ende  (YYYY-MM-DD, Standard: heute)")
+    parser.add_argument("--shorts", action="store_true",
+                        help="Short-Signale aktivieren (Margin-Konto erforderlich)")
+    parser.add_argument("--live", action="store_true",
+                        help="Live-Modus – überschreibt APCA_PAPER=true")
+    args = parser.parse_args()
+
+    cfg = dict(ORB_CONFIG)
+    if args.shorts:
+        cfg["allow_shorts"] = True
+    if args.live:
+        cfg["alpaca_paper"] = False
+        os.environ["APCA_PAPER"] = "false"
+
+    alpaca = _build_alpaca_client(cfg)
+
+    # ── Modus-Ausführung ─────────────────────────────────────────────────────
+
+    if args.mode == "scan":
+        bot    = ORB_Bot(config=cfg, alpaca=alpaca)
+        result = bot.run_orb_scan()
+        print(json.dumps(result, indent=2, default=str))
+
+    elif args.mode == "status":
+        bot    = ORB_Bot(config=cfg, alpaca=alpaca)
+        status = bot.get_status()
+        print(json.dumps(status, indent=2, default=str))
+
+    elif args.mode == "eod":
+        if alpaca:
+            alpaca.close_all_positions()
+            send_telegram("ORB_Bot: manueller EOD-Close ausgeführt")
+        else:
+            print("[ERROR] Kein Alpaca-Client – EOD nicht möglich", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.mode == "backtest":
+        cfg["initial_capital"] = 10000.0
+        tester = ORB_Backtester(config=cfg, alpaca=alpaca)
+        tester.run_backtest(start_date=args.start, end_date=args.end)
+
 
 if __name__ == "__main__":
-    # run_backtest_mode() # Backtest
-    main() # Live
+    main()
